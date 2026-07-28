@@ -1,4 +1,4 @@
-# LLM Retry Proxy Configuration
+# LLM Proxy Configuration
 #
 # Copy this file to config.toml and adjust as needed.
 # The proxy hot-reloads this file on changes — no restart needed.
@@ -23,59 +23,73 @@ connect_timeout_secs = 30
 # HTTP status codes that trigger a retry
 retry_status_codes = [429, 500, 502, 503, 504, 408, 529]
 
-# Route definitions: each route maps a URL path prefix to an upstream API.
-# The first path segment of an incoming request URL is the route name.
-# Example: /tkehub/v1/chat/completions → routes.tkehub.target + /v1/chat/completions
+# ── Named Routes ───────────────────────────────────────────────────────────
+#
+# Named routes match the first path segment of the URL.
+# Example: /tkehub/v1/chat/completions → routes.tkehub
+#
+# The proxy detects the inbound protocol from the URL path:
+#   /v1/responses        → Responses API
+#   /v1/chat/completions → Chat Completions
+#   /v1/messages         → Anthropic Messages
+#
+# upstream_formats declares what the upstream supports (ordered by preference).
+# If the inbound format is in the list → passthrough (no conversion).
+# If not → convert to the first format in the list.
+# Empty (unset) → passthrough anything.
 
 [routes.tkehub]
 target = "http://tkehub.woa.com"
+upstream_formats = ["responses"]
 
-[routes.deepseek]
-target = "https://api.deepseek.com"
+# ── Default Route ──────────────────────────────────────────────────────────
+#
+# The default route matches URLs WITHOUT a route name prefix.
+# Example: /v1/responses → routes.default (model field determines upstream)
+#
+# This enables unified access: all AI CLI tools point to the same address
+# (http://127.0.0.1:8888), and the model field in the request body
+# determines which upstream to use.
+#
+# The default route has no route-level target — each model has its own.
 
-[routes.tokenhub]
+[routes.default]
+
+# GLM: upstream supports Chat + Anthropic, auto-detects and converts if needed
+[routes.default.models."tkehub-glm"]
+target = "http://tkehub.woa.com"
+upstream_formats = ["chat", "anthropic"]
+api_key = "${TKEHUB_API_KEY}"
+upstream_model = "tke/glm-latest"
+
+# DeepSeek: upstream only supports Chat, converts from Responses/Anthropic
+[routes.default.models."tkehub-deepseek"]
 target = "https://tokenhub.tencentmaas.com"
+upstream_formats = ["chat"]
+api_key = "${TKEHUB_API_KEY}"
+upstream_model = "deepseek-chat"
 
-# Protocol transform example: convert /v1/responses → /v1/chat/completions
-# This enables AI tools like Codex (which use Responses API) to work with
-# any Chat Completions compatible API provider.
+# ── Model-level Configuration ──────────────────────────────────────────────
 #
-# [routes.tkehub-codex]
-# target = "http://tkehub.woa.com/v1"
-# transform = "responses_to_chat"
-
-# ── Model-level routing ────────────────────────────────────────────────────
+# All fields are optional — only specified fields override the route-level config.
 #
-# When the request body contains a `model` field, the proxy looks it up in
-# the route's `models` map. If found, model-level config overrides the
-# route-level config. If not found, the route-level config is used as-is.
-#
-# This enables a single route (provider) to manage multiple models from
-# different upstreams — ideal for AI CLI tools like Codex that only allow
-# model switching within the same provider.
-#
-# Model-level fields (all optional — only specified fields override):
-#   target              — upstream API URL
-#   transform           — "responses_to_chat" or "none" to explicitly disable
-#   upstream_model      — rewrite the `model` field in the request body
-#   rewrite_response_model — rewrite the `model` field in responses back to
-#                            the client's original model name (default: false)
+#   target           — upstream base URL (llm-proxy auto-appends standard API path)
+#   upstream_formats — list of protocols the upstream supports, ordered by preference
+#                      ["responses"] / ["chat"] / ["anthropic"] / ["chat", "anthropic"]
+#   api_key          — API key for the upstream (supports ${ENV_VAR} expansion)
+#   upstream_model   — rewrite the model field in requests (and auto-rewrite responses)
 #   max_retries, base_delay_ms, max_delay_ms, max_total_wait_ms,
 #   connect_timeout_secs, retry_status_codes
 #
-# Example: single route managing multiple providers for Codex
+# ── Named Route with Model Overrides ───────────────────────────────────────
 #
 # [routes.tkehub]
 # target = "http://tkehub.woa.com"
-# transform = "responses_to_chat"  # route-level default for all models
+# upstream_formats = ["responses"]  # upstream natively supports responses
 #
-# # GLM supports Responses API natively — direct passthrough, no transform
-# [routes.tkehub.models."tke/glm-latest"]
-# transform = "none"
-#
-# # DeepSeek goes to a different upstream, needs transform + model name mapping
+# # DeepSeek goes to a different upstream, needs conversion to chat
 # [routes.tkehub.models."tke/deepseek-flash-latest"]
 # target = "https://tokenhub.tencentmaas.com"
+# upstream_formats = ["chat"]
+# api_key = "${TKEHUB_API_KEY}"
 # upstream_model = "deepseek-chat"
-# rewrite_response_model = true
-# max_delay_ms = 30000

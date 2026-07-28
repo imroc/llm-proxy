@@ -1,3 +1,4 @@
+use crate::format::UpstreamFormats;
 use arc_swap::ArcSwap;
 use notify::{event::EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Deserialize;
@@ -5,6 +6,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
+
+/// Special route name for the default route.
+/// Requests without a route name in the URL path hit this route.
+pub const DEFAULT_ROUTE: &str = "default";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -49,15 +54,16 @@ impl Default for Defaults {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelConfig {
     pub target: Option<String>,
-    /// Protocol transform: "responses_to_chat" or "none" to explicitly disable.
+    /// Upstream-supported protocol formats, ordered by preference.
+    /// Empty (unset) means "accept anything, passthrough".
     #[serde(default)]
-    pub transform: Option<String>,
+    pub upstream_formats: UpstreamFormats,
+    /// API key for the upstream (supports `${ENV_VAR}` expansion).
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Rewrite the `model` field in the request body before forwarding upstream.
     #[serde(default)]
     pub upstream_model: Option<String>,
-    /// Rewrite the `model` field in the response back to the client's original model name.
-    #[serde(default)]
-    pub rewrite_response_model: Option<bool>,
     #[serde(default)]
     pub max_retries: Option<u32>,
     #[serde(default)]
@@ -74,17 +80,18 @@ pub struct ModelConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Route {
-    pub target: String,
-    /// Protocol transform: "responses_to_chat" converts /v1/responses → /v1/chat/completions.
-    /// Use "none" to explicitly disable a route-level transform for specific models.
+    /// Upstream base URL. Optional for default route (each model has its own target).
     #[serde(default)]
-    pub transform: Option<String>,
+    pub target: Option<String>,
+    /// Upstream-supported protocol formats, ordered by preference.
+    #[serde(default)]
+    pub upstream_formats: UpstreamFormats,
+    /// API key for the upstream (supports `${ENV_VAR}` expansion).
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Rewrite the `model` field in the request body before forwarding upstream.
     #[serde(default)]
     pub upstream_model: Option<String>,
-    /// Rewrite the `model` field in the response back to the client's original model name.
-    #[serde(default)]
-    pub rewrite_response_model: Option<bool>,
     /// Model-level overrides: keyed by the model name extracted from the request body.
     #[serde(default)]
     pub models: HashMap<String, ModelConfig>,
@@ -106,10 +113,10 @@ pub struct Route {
 /// Call `resolve_model()` to further apply model-level overrides.
 #[derive(Debug, Clone)]
 pub struct ResolvedRouteConfig {
-    pub target: String,
-    pub transform: Option<String>,
+    pub target: Option<String>,
+    pub upstream_formats: UpstreamFormats,
+    pub api_key: Option<String>,
     pub upstream_model: Option<String>,
-    pub rewrite_response_model: bool,
     pub models: HashMap<String, ModelConfig>,
     pub max_retries: u32,
     pub base_delay_ms: u64,
@@ -135,13 +142,24 @@ fn default_retry_status_codes() -> Vec<u16> {
     vec![429, 500, 502, 503, 504, 408, 529]
 }
 
-/// Normalize transform value: "none" → None (explicit disable).
-fn normalize_transform(t: &Option<String>) -> Option<String> {
-    match t {
-        Some(s) if s == "none" => None,
-        Some(s) => Some(s.clone()),
-        None => None,
+/// Expand `${ENV_VAR}` references in a string value.
+/// If the env var is not set, leaves the reference as-is.
+pub fn expand_env_vars(s: &str) -> String {
+    let mut result = s.to_string();
+    while let Some(start) = result.find("${") {
+        if let Some(end) = result[start..].find('}') {
+            let var_name = &result[start + 2..start + end];
+            if let Ok(val) = std::env::var(var_name) {
+                result.replace_range(start..start + end + 1, &val);
+            } else {
+                // Env var not set — skip to avoid infinite loop
+                break;
+            }
+        } else {
+            break;
+        }
     }
+    result
 }
 
 #[derive(Debug)]
@@ -181,15 +199,25 @@ impl Config {
                     name
                 )));
             }
-            if route.target.is_empty() {
-                return Err(ConfigError(format!("route '{}' has empty target", name)));
-            }
-            // Validate URL
-            if let Err(e) = route.target.parse::<http::Uri>() {
+            // Named routes (non-default) must have a target.
+            // Default route may omit target (each model has its own).
+            if name != DEFAULT_ROUTE && route.target.is_none() {
                 return Err(ConfigError(format!(
-                    "route '{}' target '{}' is not a valid URL: {}",
-                    name, route.target, e
+                    "route '{}' (non-default) must have a target",
+                    name
                 )));
+            }
+            // Validate URLs
+            if let Some(ref target) = route.target {
+                if target.is_empty() {
+                    return Err(ConfigError(format!("route '{}' has empty target", name)));
+                }
+                if let Err(e) = target.parse::<http::Uri>() {
+                    return Err(ConfigError(format!(
+                        "route '{}' target '{}' is not a valid URL: {}",
+                        name, target, e
+                    )));
+                }
             }
             // Validate model-level configs
             for (model_name, mc) in &route.models {
@@ -227,14 +255,15 @@ impl Config {
         Ok(())
     }
 
+    /// Resolve a named route by name, merging route-level config with defaults.
     pub fn resolve_route(&self, name: &str) -> Option<ResolvedRouteConfig> {
         let route = self.routes.get(name)?;
         let d = &self.defaults;
         Some(ResolvedRouteConfig {
             target: route.target.clone(),
-            transform: normalize_transform(&route.transform),
+            upstream_formats: route.upstream_formats.clone(),
+            api_key: route.api_key.as_ref().map(|s| expand_env_vars(s)),
             upstream_model: route.upstream_model.clone(),
-            rewrite_response_model: route.rewrite_response_model.unwrap_or(false),
             models: route.models.clone(),
             max_retries: route.max_retries.unwrap_or(d.max_retries),
             base_delay_ms: route.base_delay_ms.unwrap_or(d.base_delay_ms),
@@ -248,8 +277,26 @@ impl Config {
         })
     }
 
+    /// Get the default route config, if configured.
+    pub fn resolve_default_route(&self) -> Option<ResolvedRouteConfig> {
+        self.resolve_route(DEFAULT_ROUTE)
+    }
+
     pub fn route_names(&self) -> Vec<&str> {
         self.routes.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Collect all model names from all routes (for GET /v1/models).
+    pub fn all_model_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for route in self.routes.values() {
+            for model_name in route.models.keys() {
+                names.push(model_name.clone());
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
     }
 }
 
@@ -263,16 +310,16 @@ impl ResolvedRouteConfig {
         };
         let mut result = self.clone();
         if let Some(t) = &mc.target {
-            result.target = t.clone();
+            result.target = Some(t.clone());
         }
-        if let Some(t) = &mc.transform {
-            result.transform = normalize_transform(&Some(t.clone()));
+        if !mc.upstream_formats.is_empty() {
+            result.upstream_formats = mc.upstream_formats.clone();
+        }
+        if let Some(v) = &mc.api_key {
+            result.api_key = Some(expand_env_vars(v));
         }
         if let Some(v) = &mc.upstream_model {
             result.upstream_model = Some(v.clone());
-        }
-        if let Some(v) = mc.rewrite_response_model {
-            result.rewrite_response_model = v;
         }
         if let Some(v) = mc.max_retries {
             result.max_retries = v;
@@ -342,5 +389,62 @@ impl ConfigWatcher {
             .map_err(|e| ConfigError(format!("failed to watch config file: {}", e)))?;
 
         Ok(Self { _watcher: watcher })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_expand_env_vars() {
+        std::env::set_var("TEST_API_KEY", "secret123");
+        assert_eq!(expand_env_vars("${TEST_API_KEY}"), "secret123");
+        assert_eq!(
+            expand_env_vars("Bearer ${TEST_API_KEY}"),
+            "Bearer secret123"
+        );
+        std::env::remove_var("TEST_API_KEY");
+    }
+
+    #[test]
+    fn test_expand_env_vars_unset() {
+        assert_eq!(expand_env_vars("${NONEXISTENT_VAR}"), "${NONEXISTENT_VAR}");
+    }
+
+    #[test]
+    fn test_config_default_route_no_target() {
+        let toml_str = r#"
+[defaults]
+max_retries = 9999
+base_delay_ms = 1000
+max_delay_ms = 60000
+
+[routes.default]
+
+[routes.default.models."test-model"]
+target = "http://localhost:8080"
+upstream_formats = ["chat"]
+api_key = "test-key"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.validate().is_ok());
+        let rc = config.resolve_default_route().unwrap();
+        assert!(rc.target.is_none()); // default route has no route-level target
+    }
+
+    #[test]
+    fn test_config_named_route_must_have_target() {
+        let toml_str = r#"
+[defaults]
+max_retries = 9999
+base_delay_ms = 1000
+max_delay_ms = 60000
+
+[routes.myroute]
+# no target — should fail for non-default route
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.validate().is_err());
     }
 }

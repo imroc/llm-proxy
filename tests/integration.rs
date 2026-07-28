@@ -240,7 +240,7 @@ target = "http://{}"
     .await;
 
     assert_eq!(status, 502, "should return 502 after exhausting retries");
-    assert!(body.contains("retry_proxy_upstream_failed"));
+    assert!(body.contains("upstream_failed"));
 }
 
 #[tokio::test]
@@ -308,7 +308,7 @@ target = "http://127.0.0.1:9999"
     .await;
 
     assert_eq!(status, 404);
-    assert!(body.contains("retry_proxy_unknown_route"));
+    assert!(body.contains("unknown_route"));
 }
 
 #[tokio::test]
@@ -430,7 +430,7 @@ target = "http://127.0.0.1:1"
     .await;
 
     assert_eq!(status, 502);
-    assert!(body.contains("retry_proxy_upstream_failed"));
+    assert!(body.contains("upstream_failed"));
 }
 
 #[tokio::test]
@@ -467,7 +467,7 @@ target = "http://{}"
         status, 502,
         "should give up after total wait budget exceeded"
     );
-    assert!(body.contains("retry_proxy_upstream_failed"));
+    assert!(body.contains("upstream_failed"));
 }
 
 #[tokio::test]

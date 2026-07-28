@@ -7,16 +7,17 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_ROUTE};
+use crate::format::{self, Protocol};
 use crate::health::ResponseBody;
 use crate::log::extract_model;
 use crate::metrics::Metrics;
 use crate::retry::{
     compute_backoff_ms, compute_delay_ms, is_retryable_status, parse_retry_after_ms,
 };
-use crate::transform;
+use crate::transform::{self, StreamTransformer, TransformedRequest};
 
 const HOP_BY_HOP_REQUEST: &[&str] = &[
     "host",
@@ -39,12 +40,7 @@ const HOP_BY_HOP_RESPONSE: &[&str] = &[
 ];
 
 fn error_response(status: StatusCode, message: &str, error_type: &str) -> Response<ResponseBody> {
-    let body = serde_json::json!({
-        "error": {
-            "message": message,
-            "type": error_type,
-        }
-    });
+    let body = serde_json::json!({"error": {"message": message, "type": error_type}});
     let mut resp = Response::new(
         Full::new(Bytes::from(body.to_string()))
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
@@ -58,13 +54,38 @@ fn error_response(status: StatusCode, message: &str, error_type: &str) -> Respon
     resp
 }
 
-fn match_route(path: &str) -> Option<(&str, &str)> {
-    let path = path.strip_prefix('/')?;
-    let (route_name, rest) = path.split_once('/')?;
-    if route_name.is_empty() {
-        return None;
+/// Route match result: either a named route or the default route.
+enum RouteMatch {
+    Named { name: String, rest: String },
+    Default { rest: String },
+    NotFound,
+}
+
+/// Match the URL path against configured routes.
+/// Named routes take priority; if no named route matches, try default route.
+fn match_route(path: &str, config: &Config) -> RouteMatch {
+    let path = path.strip_prefix('/').unwrap_or(path);
+
+    // Try to split into route_name/rest
+    if let Some((first_segment, rest)) = path.split_once('/') {
+        // Check if first_segment is a named route
+        if config.routes.contains_key(first_segment) {
+            return RouteMatch::Named {
+                name: first_segment.to_string(),
+                rest: rest.to_string(),
+            };
+        }
     }
-    Some((route_name, rest))
+
+    // Check if default route is configured
+    if config.routes.contains_key(DEFAULT_ROUTE) {
+        // The rest is the full path (including the first segment)
+        RouteMatch::Default {
+            rest: path.to_string(),
+        }
+    } else {
+        RouteMatch::NotFound
+    }
 }
 
 fn build_forward_headers(req_headers: &HeaderMap) -> HeaderMap {
@@ -72,6 +93,10 @@ fn build_forward_headers(req_headers: &HeaderMap) -> HeaderMap {
     for (key, value) in req_headers {
         let lower = key.as_str().to_lowercase();
         if HOP_BY_HOP_REQUEST.contains(&lower.as_str()) {
+            continue;
+        }
+        // Drop Authorization — we use config-level api_key
+        if lower == "authorization" {
             continue;
         }
         headers.insert(key.clone(), value.clone());
@@ -91,14 +116,7 @@ fn strip_response_hop_by_hop(resp_headers: &HeaderMap) -> HeaderMap {
     headers
 }
 
-fn build_upstream_url(target: &str, rest: &str) -> String {
-    let target = target.trim_end_matches('/');
-    format!("{}/{}", target, rest)
-}
-
 /// Rewrite the `model` field in a JSON request body.
-///
-/// If the body is not valid JSON or has no `model` field, returns the original bytes.
 fn rewrite_model_in_body(body: &[u8], new_model: &str) -> Bytes {
     let mut value: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -109,13 +127,32 @@ fn rewrite_model_in_body(body: &[u8], new_model: &str) -> Bytes {
             "model".to_string(),
             serde_json::Value::String(new_model.to_string()),
         );
-        match serde_json::to_vec(&value) {
-            Ok(bytes) => Bytes::from(bytes),
-            Err(_) => Bytes::copy_from_slice(body),
-        }
+        serde_json::to_vec(&value)
+            .map(Bytes::from)
+            .unwrap_or_else(|_| Bytes::copy_from_slice(body))
     } else {
         Bytes::copy_from_slice(body)
     }
+}
+
+/// Handle GET /v1/models — return all configured model names.
+fn handle_models(config: &Config) -> Response<ResponseBody> {
+    let models: Vec<serde_json::Value> = config
+        .all_model_names()
+        .iter()
+        .map(|name| serde_json::json!({"id": name, "object": "model", "owned_by": "llm-proxy"}))
+        .collect();
+    let body = serde_json::json!({"object": "list", "data": models});
+    let mut resp = Response::new(
+        Full::new(Bytes::from(body.to_string()))
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            .boxed(),
+    );
+    resp.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+    resp
 }
 
 pub async fn handle_request(
@@ -139,34 +176,57 @@ pub async fn handle_request(
         return crate::health::handle_metrics(metrics);
     }
 
-    // Route matching
-    let (route_name, rest) = match match_route(&path) {
-        Some(v) => v,
-        None => {
-            return error_response(
-                StatusCode::NOT_FOUND,
-                &format!(
-                    "retry-proxy: unknown route \"{}\". Available routes: {}",
-                    path,
-                    config.load().route_names().join(", ")
-                ),
-                "retry_proxy_unknown_route",
-            );
-        }
-    };
-
     let config = config.load();
-    let route_config = match config.resolve_route(route_name) {
-        Some(rc) => rc,
-        None => {
+
+    // GET /v1/models or /models — return configured model list
+    if method == Method::GET && (path.ends_with("/v1/models") || path.ends_with("/models")) {
+        return handle_models(&config);
+    }
+
+    // Route matching
+    let (route_name, rest, route_config) = match match_route(&path, &config) {
+        RouteMatch::Named { name, rest } => {
+            let rc = match config.resolve_route(&name) {
+                Some(rc) => rc,
+                None => {
+                    return error_response(
+                        StatusCode::NOT_FOUND,
+                        &format!(
+                            "unknown route \"{}\". Available: {}",
+                            name,
+                            config.route_names().join(", ")
+                        ),
+                        "unknown_route",
+                    );
+                }
+            };
+            (name, rest, rc)
+        }
+        RouteMatch::Default { rest } => {
+            let rc = match config.resolve_default_route() {
+                Some(rc) => rc,
+                None => {
+                    return error_response(
+                        StatusCode::NOT_FOUND,
+                        &format!(
+                            "no route matched \"{}\" and no default route configured",
+                            path
+                        ),
+                        "unknown_route",
+                    );
+                }
+            };
+            (DEFAULT_ROUTE.to_string(), rest, rc)
+        }
+        RouteMatch::NotFound => {
             return error_response(
                 StatusCode::NOT_FOUND,
                 &format!(
-                    "retry-proxy: unknown route \"{}\". Available routes: {}",
-                    route_name,
+                    "no route matched \"{}\". Available: {}",
+                    path,
                     config.route_names().join(", ")
                 ),
-                "retry_proxy_unknown_route",
+                "unknown_route",
             );
         }
     };
@@ -174,7 +234,7 @@ pub async fn handle_request(
     // Extract headers before consuming body
     let forward_headers = build_forward_headers(req.headers());
 
-    // Read full request body (for replay + model extraction)
+    // Read full request body
     let has_body = method != Method::GET && method != Method::HEAD;
     let body_bytes: Bytes = if has_body {
         match req.collect().await {
@@ -182,8 +242,8 @@ pub async fn handle_request(
             Err(e) => {
                 return error_response(
                     StatusCode::BAD_REQUEST,
-                    &format!("retry-proxy: failed to read request body: {}", e),
-                    "retry_proxy_read_body_failed",
+                    &format!("failed to read request body: {}", e),
+                    "read_body_failed",
                 );
             }
         }
@@ -200,6 +260,49 @@ pub async fn handle_request(
         route_config.resolve_model(model)
     } else {
         route_config
+    };
+
+    // For default route, model must be present (to determine target)
+    if route_name == DEFAULT_ROUTE && route_config.target.is_none() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "default route requires a model field in the request body to determine the upstream target",
+            "missing_model",
+        );
+    }
+
+    // Determine target URL
+    let target = match &route_config.target {
+        Some(t) => t.clone(),
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "no target configured for this route/model",
+                "no_target",
+            );
+        }
+    };
+
+    // Detect inbound protocol from URL path
+    let inbound_protocol = format::Protocol::from_path(&rest).unwrap_or(format::Protocol::Chat); // default to chat if unknown
+
+    // Determine conversion direction
+    let conversion = format::conversion_direction(inbound_protocol, &route_config.upstream_formats);
+
+    // Determine the upstream protocol (target format)
+    let upstream_protocol = conversion.map(|(_, to)| to).unwrap_or(inbound_protocol);
+
+    // Inject API key from config
+    let forward_headers = if let Some(ref api_key) = route_config.api_key {
+        let mut h = forward_headers.clone();
+        h.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(&format!("Bearer {}", api_key))
+                .unwrap_or_else(|_| http::HeaderValue::from_static("Bearer")),
+        );
+        h
+    } else {
+        forward_headers
     };
 
     // Rewrite model in request body if upstream_model is configured
@@ -220,121 +323,95 @@ pub async fn handle_request(
         body_bytes
     };
 
+    // The client's model name (for response rewriting)
+    let response_model = client_model.as_deref();
+
+    // Determine upstream URL path
+    let upstream_path = upstream_protocol.api_path();
+    let upstream_url = format!("{}{}", target.trim_end_matches('/'), upstream_path);
+
     let tag = if !model_str.is_empty() {
         format!("[{}|{}]", route_name, model_str)
     } else {
         format!("[{}]", route_name)
     };
 
-    metrics.record_request(route_name, model_str);
+    metrics.record_request(&route_name, model_str);
 
-    // Protocol transform: /v1/responses → /v1/chat/completions
-    let transform_active = route_config.transform.as_deref() == Some(transform::RESPONSES_TO_CHAT);
-    // Rewrite path for upstream: strip the leading version prefix since
-    // target already contains it, then replace responses with chat/completions
-    let rest = if transform_active {
-        // Strip leading "v1/" or "v2/" version prefix (target already contains it)
-        let stripped = rest
-            .strip_prefix("v1/")
-            .or_else(|| rest.strip_prefix("v2/"))
-            .unwrap_or(rest);
-        stripped
-            .replace("responses", "chat/completions")
-            .to_string()
+    // Apply request transform if needed
+    let request_body = if let Some((from, to)) = conversion {
+        match transform::transform_request(from, to, &body_bytes) {
+            Ok(TransformedRequest { body, .. }) => {
+                tracing::debug!(
+                    "{} transform: {} → {} ({} bytes)",
+                    tag,
+                    from,
+                    to,
+                    body.len()
+                );
+                body
+            }
+            Err(e) => {
+                warn!("{} transform failed: {}, sending original body", tag, e);
+                body_bytes.clone()
+            }
+        }
     } else {
-        rest.to_string()
+        body_bytes.clone()
     };
 
-    let upstream_url = build_upstream_url(&route_config.target, &rest);
+    tracing::debug!(
+        "{} upstream URL: {} body={}bytes",
+        tag,
+        upstream_url,
+        request_body.len()
+    );
 
-    // Determine the model name to use in responses (for rewrite_response_model)
-    let response_rewrite_model = if route_config.rewrite_response_model {
-        Some(model_str.to_string())
-    } else {
-        None
-    };
-
+    // Retry loop
     let start_time = Instant::now();
     let mut attempt: u32 = 0;
     let mut total_wait_ms: u64 = 0;
 
     loop {
-        // Check max_retries
         if attempt >= route_config.max_retries {
             warn!(
-                "{} -> {} retry exhausted (max_retries={}), returning 502",
+                "{} -> {} retry exhausted (max_retries={})",
                 tag, upstream_url, route_config.max_retries
             );
             return error_response(
                 StatusCode::BAD_GATEWAY,
-                &format!(
-                    "retry-proxy: upstream request failed after {} attempts (max retries exceeded)",
-                    attempt
-                ),
-                "retry_proxy_upstream_failed",
+                "upstream request failed (max retries exceeded)",
+                "upstream_failed",
             );
         }
 
-        // Check max_total_wait_ms (fallback)
         if route_config.max_total_wait_ms > 0 && total_wait_ms >= route_config.max_total_wait_ms {
             warn!(
-                "{} -> {} total wait budget exceeded ({}ms), returning 502",
+                "{} -> {} total wait budget exceeded ({}ms)",
                 tag, upstream_url, route_config.max_total_wait_ms
             );
             return error_response(
                 StatusCode::BAD_GATEWAY,
-                &format!(
-                    "retry-proxy: upstream request failed after total wait budget ({}ms) exceeded",
-                    route_config.max_total_wait_ms
-                ),
-                "retry_proxy_upstream_failed",
+                "upstream request failed (total wait exceeded)",
+                "upstream_failed",
             );
         }
 
-        // Build request body (apply transform if active)
-        let request_body = if transform_active {
-            match transform::responses_to_chat_request(&body_bytes) {
-                Some(body) => {
-                    tracing::debug!("{} transform: responses → chat ({} bytes)", tag, body.len());
-                    body
-                }
-                None => {
-                    tracing::warn!("{} transform failed, sending original body", tag);
-                    body_bytes.clone()
-                }
-            }
-        } else {
-            body_bytes.clone()
-        };
-
-        tracing::debug!(
-            "{} upstream URL: {} body={}bytes",
-            tag,
-            upstream_url,
-            request_body.len()
-        );
-
-        // Build request
         let req_builder = client
             .request(method.clone(), &upstream_url)
             .headers(forward_headers.clone());
 
         let req_builder = if has_body {
-            req_builder.body(request_body)
+            req_builder.body(request_body.clone())
         } else {
             req_builder
         };
 
-        // Send request with disconnect detection
         let send_result = tokio::select! {
             r = req_builder.send() => r,
             _ = disconnect_token.cancelled() => {
                 info!("{} -> {} client disconnected during request", tag, upstream_url);
-                return error_response(
-                    StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_GATEWAY),
-                    "retry-proxy: client disconnected",
-                    "retry_proxy_client_disconnected",
-                );
+                return error_response(StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_GATEWAY), "client disconnected", "client_disconnected");
             }
         };
 
@@ -344,10 +421,8 @@ pub async fn handle_request(
                 let retryable = is_retryable_status(status, &route_config.retry_status_codes);
 
                 if retryable && attempt < route_config.max_retries {
-                    // Extract headers before consuming body
                     let retry_after_ms = parse_retry_after_ms(response.headers());
-                    // Read error body for logging
-                    let body_text = response.text().await.unwrap_or_default();
+                    let _body_text = response.text().await.unwrap_or_default();
                     let backoff_ms = compute_backoff_ms(
                         route_config.base_delay_ms,
                         route_config.max_delay_ms,
@@ -355,58 +430,35 @@ pub async fn handle_request(
                     );
                     let delay_ms = compute_delay_ms(retry_after_ms, backoff_ms);
 
-                    // Check total wait budget
                     if route_config.max_total_wait_ms > 0
                         && total_wait_ms + delay_ms > route_config.max_total_wait_ms
                     {
-                        warn!(
-                            "{} -> {} total wait would exceed budget ({}+{} > {}ms), returning 502",
-                            tag,
-                            upstream_url,
-                            total_wait_ms,
-                            delay_ms,
-                            route_config.max_total_wait_ms
-                        );
+                        warn!("{} -> {} total wait would exceed budget", tag, upstream_url);
                         return error_response(
                             StatusCode::BAD_GATEWAY,
-                            &format!(
-                                "retry-proxy: upstream request failed after total wait budget ({}ms) would be exceeded",
-                                route_config.max_total_wait_ms
-                            ),
-                            "retry_proxy_upstream_failed",
+                            "upstream request failed (budget exceeded)",
+                            "upstream_failed",
                         );
                     }
 
                     info!(
-                        "{} -> {} HTTP {} retry {}/{} in {}ms (total_wait={}ms) body={}",
+                        "{} -> {} HTTP {} retry {}/{} in {}ms",
                         tag,
                         upstream_url,
                         status,
                         attempt + 1,
                         route_config.max_retries,
-                        delay_ms,
-                        total_wait_ms + delay_ms,
-                        if body_text.len() > 500 {
-                            &body_text[..500]
-                        } else {
-                            &body_text
-                        }
+                        delay_ms
                     );
-
-                    metrics.record_retry(route_name, model_str);
+                    metrics.record_retry(&route_name, model_str);
                     attempt += 1;
                     total_wait_ms += delay_ms;
 
-                    // Sleep with disconnect detection
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
                         _ = disconnect_token.cancelled() => {
                             info!("{} -> {} client disconnected during backoff", tag, upstream_url);
-                            return error_response(
-                                StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_GATEWAY),
-                                "retry-proxy: client disconnected",
-                                "retry_proxy_client_disconnected",
-                            );
+                            return error_response(StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_GATEWAY), "client disconnected", "client_disconnected");
                         }
                     }
                     continue;
@@ -414,56 +466,53 @@ pub async fn handle_request(
 
                 if retryable {
                     warn!(
-                        "{} -> {} retry exhausted (max_retries={}), returning status={}",
-                        tag, upstream_url, route_config.max_retries, status
+                        "{} -> {} retry exhausted, returning status={}",
+                        tag, upstream_url, status
                     );
                 }
 
-                // Non-retryable or exhausted: stream response to client
-                metrics.record_upstream_status(route_name, model_str, status);
+                metrics.record_upstream_status(&route_name, model_str, status);
                 let duration = start_time.elapsed();
-                metrics.record_duration(route_name, model_str, duration);
+                metrics.record_duration(&route_name, model_str, duration);
 
-                if transform_active {
-                    return build_transform_response(
+                // Build response with appropriate transform
+                let is_stream = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|ct| ct.contains("text/event-stream"))
+                    .unwrap_or(false);
+
+                if is_stream {
+                    return build_streaming_response(
                         response,
-                        response_rewrite_model.as_deref(),
+                        upstream_protocol,
+                        inbound_protocol,
+                        response_model,
                         &tag,
                         &upstream_url,
                         disconnect_token,
                     )
                     .await;
-                }
-
-                if response_rewrite_model.is_some() {
-                    return build_streaming_response_with_rewrite(
+                } else {
+                    return build_non_streaming_response(
                         response,
-                        response_rewrite_model.as_deref().unwrap_or(""),
+                        upstream_protocol,
+                        inbound_protocol,
+                        response_model,
                         &tag,
                         &upstream_url,
-                        disconnect_token,
                     )
                     .await;
                 }
-
-                return build_streaming_response(response, &tag, &upstream_url, disconnect_token)
-                    .await;
             }
             Err(e) => {
-                // Network error
                 if attempt >= route_config.max_retries {
-                    warn!(
-                        "{} -> {} network error exhausted (max_retries={}): {}",
-                        tag, upstream_url, route_config.max_retries, e
-                    );
+                    warn!("{} -> {} network error exhausted: {}", tag, upstream_url, e);
                     return error_response(
                         StatusCode::BAD_GATEWAY,
-                        &format!(
-                            "retry-proxy: upstream request failed after {} attempts: {}",
-                            attempt + 1,
-                            e
-                        ),
-                        "retry_proxy_upstream_failed",
+                        &format!("upstream request failed: {}", e),
+                        "upstream_failed",
                     );
                 }
 
@@ -472,49 +521,34 @@ pub async fn handle_request(
                     route_config.max_delay_ms,
                     attempt,
                 );
-                let delay_ms = compute_delay_ms(None, backoff_ms);
 
                 if route_config.max_total_wait_ms > 0
-                    && total_wait_ms + delay_ms > route_config.max_total_wait_ms
+                    && total_wait_ms + backoff_ms > route_config.max_total_wait_ms
                 {
-                    warn!(
-                        "{} -> {} total wait would exceed budget ({}+{} > {}ms), returning 502",
-                        tag, upstream_url, total_wait_ms, delay_ms, route_config.max_total_wait_ms
-                    );
                     return error_response(
                         StatusCode::BAD_GATEWAY,
-                        &format!(
-                            "retry-proxy: upstream request failed after total wait budget ({}ms) would be exceeded: {}",
-                            route_config.max_total_wait_ms, e
-                        ),
-                        "retry_proxy_upstream_failed",
+                        "upstream request failed (budget exceeded)",
+                        "upstream_failed",
                     );
                 }
 
                 info!(
-                    "{} -> {} network error retry {}/{} in {}ms (total_wait={}ms): {}",
+                    "{} -> {} network error, retry {}/{} in {}ms: {}",
                     tag,
                     upstream_url,
                     attempt + 1,
                     route_config.max_retries,
-                    delay_ms,
-                    total_wait_ms + delay_ms,
+                    backoff_ms,
                     e
                 );
-
-                metrics.record_retry(route_name, model_str);
+                metrics.record_retry(&route_name, model_str);
                 attempt += 1;
-                total_wait_ms += delay_ms;
+                total_wait_ms += backoff_ms;
 
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
                     _ = disconnect_token.cancelled() => {
-                        info!("{} -> {} client disconnected during backoff", tag, upstream_url);
-                        return error_response(
-                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_GATEWAY),
-                            "retry-proxy: client disconnected",
-                            "retry_proxy_client_disconnected",
-                        );
+                        return error_response(StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_GATEWAY), "client disconnected", "client_disconnected");
                     }
                 }
                 continue;
@@ -523,336 +557,146 @@ pub async fn handle_request(
     }
 }
 
-async fn build_streaming_response(
+/// Build a non-streaming response, applying protocol transform if needed.
+async fn build_non_streaming_response(
     response: reqwest::Response,
+    upstream_protocol: Protocol,
+    inbound_protocol: Protocol,
+    client_model: Option<&str>,
     tag: &str,
-    upstream_url: &str,
-    disconnect_token: CancellationToken,
+    _upstream_url: &str,
 ) -> Response<ResponseBody> {
     let status = response.status();
-    let headers = strip_response_hop_by_hop(response.headers());
-    let tag = tag.to_string();
-    let upstream_url = upstream_url.to_string();
+    let resp_headers = strip_response_hop_by_hop(response.headers());
+    let body_bytes = response.bytes().await.unwrap_or_default();
 
-    let (tx, rx) = mpsc::channel::<
-        Result<hyper::body::Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>,
-    >(32);
-
-    // Spawn streaming task
-    tokio::spawn(async move {
-        let mut response = response;
-        loop {
-            tokio::select! {
-                chunk = response.chunk() => {
-                    match chunk {
-                        Ok(Some(bytes)) => {
-                            if tx.send(Ok(hyper::body::Frame::data(bytes))).await.is_err() {
-                                // Client disconnected (receiver dropped)
-                                break;
-                            }
-                        }
-                        Ok(None) => break, // Stream ended normally
-                        Err(e) => {
-                            warn!("upstream stream error: {}", e);
-                            let _ = tx.send(Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)).await;
-                            break;
-                        }
-                    }
-                }
-                _ = disconnect_token.cancelled() => {
-                    info!("{} -> {} client disconnected during streaming", tag, upstream_url);
-                    break;
-                }
+    // Apply response transform if needed
+    let body_bytes = if upstream_protocol != inbound_protocol {
+        match transform::transform_response_body(
+            upstream_protocol,
+            inbound_protocol,
+            &body_bytes,
+            client_model,
+        ) {
+            Ok(transformed) => transformed,
+            Err(e) => {
+                warn!(
+                    "{} response transform failed: {}, passing through original",
+                    tag, e
+                );
+                body_bytes
             }
         }
-        // Dropping `response` closes the reqwest connection
-        drop(response);
-    });
+    } else {
+        // Passthrough — rewrite model if needed
+        transform::common::rewrite_model_in_response(&body_bytes, client_model)
+    };
 
-    let stream = ReceiverStream::new(rx);
-    let body = StreamBody::new(stream);
-
-    let mut resp = Response::new(BodyExt::boxed(body));
+    let mut resp = Response::new(
+        Full::new(body_bytes)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            .boxed(),
+    );
     *resp.status_mut() = status;
-    for (key, value) in &headers {
+    for (key, value) in &resp_headers {
         resp.headers_mut().insert(key.clone(), value.clone());
     }
     resp
 }
 
-/// Build a streaming response with model field rewriting.
-///
-/// For SSE responses: parse each `data: {...}` line, replace the `model` field, re-serialize.
-/// For non-SSE responses: buffer the full body, parse JSON, replace model, send.
-async fn build_streaming_response_with_rewrite(
+/// Build a streaming response, applying protocol transform if needed.
+async fn build_streaming_response(
     response: reqwest::Response,
-    rewrite_model: &str,
+    upstream_protocol: Protocol,
+    inbound_protocol: Protocol,
+    client_model: Option<&str>,
     tag: &str,
     upstream_url: &str,
-    disconnect_token: CancellationToken,
+    _disconnect_token: CancellationToken,
 ) -> Response<ResponseBody> {
     let status = response.status();
-    let headers = strip_response_hop_by_hop(response.headers());
-    let is_sse = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.contains("text/event-stream"))
-        .unwrap_or(false);
+    let resp_headers = strip_response_hop_by_hop(response.headers());
 
-    let tag = tag.to_string();
-    let upstream_url = upstream_url.to_string();
-    let rewrite_model = rewrite_model.to_string();
+    let mut stream_transformer =
+        StreamTransformer::new(upstream_protocol, inbound_protocol, client_model);
 
-    if !is_sse {
-        // Non-SSE: buffer full body, parse JSON, replace model
-        let body_bytes = response.bytes().await.unwrap_or_default();
-        let rewritten = rewrite_model_in_json(&body_bytes, &rewrite_model);
-        let mut resp = Response::new(
-            Full::new(rewritten)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-                .boxed(),
-        );
-        *resp.status_mut() = status;
-        for (key, value) in &headers {
-            resp.headers_mut().insert(key.clone(), value.clone());
-        }
-        return resp;
-    }
+    let (tx, rx) = mpsc::channel::<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>(128);
+    let tag_owned = tag.to_string();
+    let upstream_url_owned = upstream_url.to_string();
 
-    // SSE streaming with model rewrite
-    let (tx, rx) = mpsc::channel::<
-        Result<hyper::body::Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>,
-    >(32);
-
-    let tag_clone = tag.clone();
-    let url_clone = upstream_url.clone();
+    // Spawn the streaming task
     tokio::spawn(async move {
-        let mut response = response;
-        let mut buf = String::new();
+        use futures::StreamExt;
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
 
-        loop {
-            tokio::select! {
-                chunk = response.chunk() => {
-                    match chunk {
-                        Ok(Some(bytes)) => {
-                            buf.push_str(&String::from_utf8_lossy(&bytes));
-                            // Process complete lines
-                            while let Some(i) = buf.find('\n') {
-                                let line = buf[..=i].to_string();
-                                buf = buf[i+1..].to_string();
-                                let rewritten = rewrite_model_in_sse_line(&line, &rewrite_model);
-                                let data = Bytes::from(rewritten);
-                                if tx.send(Ok(hyper::body::Frame::data(data))).await.is_err() {
-                                    break;
-                                }
+        while let Some(chunk_result) = stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                    // Process complete lines
+                    while let Some(pos) = buffer.find('\n') {
+                        let line = buffer[..=pos].to_string();
+                        buffer = buffer[pos + 1..].to_string();
+
+                        let transformed = stream_transformer.transform_sse_line(&line);
+                        if let Some(output) = transformed {
+                            if tx.send(Ok(Bytes::from(output))).await.is_err() {
+                                // Client disconnected
+                                debug!(
+                                    "{} -> {} client disconnected during streaming",
+                                    tag_owned, upstream_url_owned
+                                );
+                                break;
                             }
-                        }
-                        Ok(None) => break,
-                        Err(e) => {
-                            warn!("upstream stream error: {}", e);
-                            break;
                         }
                     }
                 }
-                _ = disconnect_token.cancelled() => {
-                    info!("{} -> {} client disconnected during streaming (rewrite)", tag_clone, url_clone);
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>))
+                        .await;
                     break;
                 }
             }
         }
-        drop(response);
+
+        // Flush remaining buffer
+        if !buffer.is_empty() {
+            let transformed = stream_transformer.transform_sse_line(&buffer);
+            if let Some(output) = transformed {
+                let _ = tx.send(Ok(Bytes::from(output))).await;
+            }
+        }
+
+        // Signal end of stream
+        let _ = tx.send(Ok(Bytes::new())).await;
+        drop(tag_owned);
+        drop(upstream_url_owned);
     });
 
-    let stream = ReceiverStream::new(rx);
-    let body = StreamBody::new(stream);
+    let body = ReceiverStream::new(rx);
+    let mapped = tokio_stream::StreamExt::map(body, |chunk: Result<Bytes, Box<dyn std::error::Error + Send + Sync>>| -> Result<http_body::Frame<Bytes>, std::convert::Infallible> {
+        Ok(http_body::Frame::data(chunk.unwrap_or_default()))
+    });
+    let boxed = http_body_util::BodyExt::boxed(http_body_util::BodyExt::map_err(
+        StreamBody::new(mapped),
+        |e: std::convert::Infallible| -> Box<dyn std::error::Error + Send + Sync> { match e {} },
+    ));
 
-    let mut resp = Response::new(BodyExt::boxed(body));
+    let mut resp = Response::new(boxed);
     *resp.status_mut() = status;
-    resp.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        "text/event-stream".parse().unwrap(),
-    );
-    resp.headers_mut()
-        .insert("cache-control", "no-cache".parse().unwrap());
-    resp
-}
-
-/// Rewrite the `model` field in a JSON body.
-fn rewrite_model_in_json(body: &[u8], new_model: &str) -> Bytes {
-    let mut value: serde_json::Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return Bytes::copy_from_slice(body),
-    };
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert(
-            "model".to_string(),
-            serde_json::Value::String(new_model.to_string()),
-        );
+    for (key, value) in &resp_headers {
+        resp.headers_mut().insert(key.clone(), value.clone());
     }
-    match serde_json::to_vec(&value) {
-        Ok(bytes) => Bytes::from(bytes),
-        Err(_) => Bytes::copy_from_slice(body),
-    }
-}
-
-/// Rewrite the `model` field in a single SSE line.
-///
-/// SSE lines that are not `data: {json}` are passed through unchanged.
-fn rewrite_model_in_sse_line(line: &str, new_model: &str) -> String {
-    let trimmed = line.trim_end();
-    let Some(json_str) = trimmed.strip_prefix("data: ") else {
-        return line.to_string();
-    };
-    let json_str = json_str.trim();
-    if json_str == "[DONE]" {
-        return line.to_string();
-    }
-    let mut value: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v,
-        Err(_) => return line.to_string(),
-    };
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert(
-            "model".to_string(),
-            serde_json::Value::String(new_model.to_string()),
-        );
-    }
-    match serde_json::to_string(&value) {
-        Ok(serialized) => format!("data: {}\n\n", serialized),
-        Err(_) => line.to_string(),
-    }
-}
-
-/// Build a response for the responses_to_chat transform.
-///
-/// For non-streaming: buffer the full body and convert.
-/// For streaming: convert SSE chunks in real time.
-///
-/// `rewrite_model`: if Some, use this model name in the response output instead
-/// of the upstream model (for rewrite_response_model).
-async fn build_transform_response(
-    response: reqwest::Response,
-    rewrite_model: Option<&str>,
-    tag: &str,
-    upstream_url: &str,
-    disconnect_token: CancellationToken,
-) -> Response<ResponseBody> {
-    let tag = tag.to_string();
-    let upstream_url = upstream_url.to_string();
-
-    // Check content-type to determine streaming vs non-streaming
-    let is_stream = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.contains("text/event-stream"))
-        .unwrap_or(false);
-
-    if !is_stream {
-        // Non-streaming: buffer and convert
-        let chat_body = response.bytes().await.unwrap_or_default();
-        let converted =
-            transform::chat_response_to_responses(&chat_body, rewrite_model).unwrap_or(chat_body);
-        let mut resp = Response::new(
-            Full::new(converted)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-                .boxed(),
-        );
-        *resp.status_mut() = StatusCode::OK;
+    // Ensure SSE content type for streaming
+    if !resp.headers().contains_key("content-type") {
         resp.headers_mut().insert(
             http::header::CONTENT_TYPE,
-            "application/json".parse().unwrap(),
+            "text/event-stream".parse().unwrap(),
         );
-        return resp;
     }
 
-    // Streaming: convert SSE chunks
-    // Use the rewrite model if provided, otherwise extract from the first response chunk
-    let stream_model = rewrite_model.unwrap_or("").to_string();
-
-    let (tx, rx) = mpsc::channel::<
-        Result<hyper::body::Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>,
-    >(32);
-
-    let tag_clone = tag.clone();
-    let url_clone = upstream_url.clone();
-    tokio::spawn(async move {
-        let mut response = response;
-        // Determine model: if rewrite_model is set, use it; otherwise extract from first chunk
-        let mut model = stream_model.clone();
-        let mut state = transform::StreamTransformState::new(&model, None);
-        // Buffer for incomplete SSE lines
-        let mut buf = String::new();
-
-        loop {
-            tokio::select! {
-                chunk = response.chunk() => {
-                    match chunk {
-                        Ok(Some(bytes)) => {
-                            buf.push_str(&String::from_utf8_lossy(&bytes));
-                            // Process complete lines
-                            while let Some(i) = buf.find('\n') {
-                                let line = buf[..=i].trim_end().to_string();
-                                buf = buf[i+1..].to_string();
-                                // If we don't have a model yet (rewrite not set), try to extract from the chunk
-                                if model.is_empty() {
-                                    if let Some(m) = extract_model_from_sse_line(&line) {
-                                        model = m;
-                                        state.model = model.clone();
-                                    }
-                                }
-                                if let Some(sse) = transform::transform_chat_sse_chunk(&line, &mut state) {
-                                    let data = Bytes::from(sse);
-                                    if tx.send(Ok(hyper::body::Frame::data(data))).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(e) => {
-                            warn!("upstream stream error: {}", e);
-                            break;
-                        }
-                    }
-                }
-                _ = disconnect_token.cancelled() => {
-                    info!("{} -> {} client disconnected during transform streaming", tag_clone, url_clone);
-                    break;
-                }
-            }
-        }
-        // Always flush stream completion -- even if upstream closed without [DONE],
-        // the client (Codex) needs response.completed to avoid "Reconnecting".
-        // The completed flag in state prevents double-flush if [DONE] was already seen.
-        if let Some(sse) = transform::transform_chat_sse_chunk("data: [DONE]", &mut state) {
-            let data = Bytes::from(sse);
-            let _ = tx.send(Ok(hyper::body::Frame::data(data))).await;
-        }
-        drop(response);
-    });
-
-    let stream = ReceiverStream::new(rx);
-    let body = StreamBody::new(stream);
-
-    let mut resp = Response::new(BodyExt::boxed(body));
-    *resp.status_mut() = StatusCode::OK;
-    resp.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        "text/event-stream".parse().unwrap(),
-    );
-    resp.headers_mut()
-        .insert("cache-control", "no-cache".parse().unwrap());
     resp
-}
-
-/// Extract model name from an SSE `data: {...}` line.
-fn extract_model_from_sse_line(line: &str) -> Option<String> {
-    let data_str = line.strip_prefix("data: ")?.trim();
-    if data_str == "[DONE]" {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_str(data_str).ok()?;
-    value.get("model")?.as_str().map(|s| s.to_string())
 }
