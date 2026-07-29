@@ -366,6 +366,31 @@ pub async fn handle_request(
         upstream_url,
         request_body.len()
     );
+    if conversion.is_some() {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&request_body) {
+            if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
+                let summary: Vec<String> = msgs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("MISSING");
+                        let tc = m
+                            .get("tool_calls")
+                            .and_then(|t| t.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+                        let clen = m
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        format!("msg[{}]:role={}:tc={}:len={}", i, role, tc, clen)
+                    })
+                    .collect();
+                tracing::debug!("{} converted messages: {}", tag, summary.join(", "));
+            }
+        }
+    }
 
     // Retry loop
     let start_time = Instant::now();
@@ -569,6 +594,17 @@ async fn build_non_streaming_response(
     let status = response.status();
     let resp_headers = strip_response_hop_by_hop(response.headers());
     let body_bytes = response.bytes().await.unwrap_or_default();
+
+    // Debug log non-200 responses
+    if !status.is_success() {
+        let body_preview = String::from_utf8_lossy(&body_bytes);
+        let p = if body_preview.len() > 1000 {
+            &body_preview[..1000]
+        } else {
+            &body_preview
+        };
+        tracing::debug!("{} upstream returned {}: response body: {}", tag, status, p);
+    }
 
     // Apply response transform only on 2xx success responses.
     // Error responses (4xx/5xx) are passed through as-is.

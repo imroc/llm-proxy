@@ -1023,10 +1023,11 @@ fn append_responses_item_as_chat_message(
         Some("message") => {
             flush_pending_tool_calls(messages, pending_tool_calls);
             let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            let role = if role == "developer" { "system" } else { role };
             let content = responses_content_to_chat_text(item);
             messages.push(json!({"role": role, "content": content}));
         }
-        Some("function_call") => {
+        Some("local_shell_call") | Some("custom_tool_call") | Some("function_call") => {
             let id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
             let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let arguments = item
@@ -1045,17 +1046,25 @@ fn append_responses_item_as_chat_message(
             let output = item.get("output").and_then(|v| v.as_str()).unwrap_or("");
             messages.push(json!({"role": "tool", "tool_call_id": call_id, "content": output}));
         }
+        // Item without a recognized type — try role-based handling
         _ => {
-            // Item without type — check if it has a role (message-like)
             if item.get("role").is_some() {
+                // Message-like item without explicit type
                 flush_pending_tool_calls(messages, pending_tool_calls);
                 let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+                // Map "developer" role to "system" for broader compatibility
+                // (OpenAI introduced "developer" as a replacement for "system",
+                // but many third-party APIs only accept "system")
+                let role = if role == "developer" { "system" } else { role };
                 let content = responses_content_to_chat_text(item);
                 messages.push(json!({"role": role, "content": content}));
             } else if let Some(text) = item.as_str() {
                 // Bare string input
                 messages.push(json!({"role": "user", "content": text}));
             }
+            // Skip unknown item types (reasoning, local_shell_call, web_search_call,
+            // image_generation_call, compaction, tool_search_call, etc.)
+            // These don't have a chat completions equivalent.
         }
     }
 }
