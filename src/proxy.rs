@@ -570,8 +570,9 @@ async fn build_non_streaming_response(
     let resp_headers = strip_response_hop_by_hop(response.headers());
     let body_bytes = response.bytes().await.unwrap_or_default();
 
-    // Apply response transform if needed
-    let body_bytes = if upstream_protocol != inbound_protocol {
+    // Apply response transform only on 2xx success responses.
+    // Error responses (4xx/5xx) are passed through as-is.
+    let body_bytes = if status.is_success() && upstream_protocol != inbound_protocol {
         match transform::transform_response_body(
             upstream_protocol,
             inbound_protocol,
@@ -617,8 +618,12 @@ async fn build_streaming_response(
     let status = response.status();
     let resp_headers = strip_response_hop_by_hop(response.headers());
 
-    let mut stream_transformer =
-        StreamTransformer::new(upstream_protocol, inbound_protocol, client_model);
+    // Only apply stream transform on 2xx success. Error responses passthrough.
+    let mut stream_transformer = if status.is_success() {
+        StreamTransformer::new(upstream_protocol, inbound_protocol, client_model)
+    } else {
+        StreamTransformer::new(upstream_protocol, upstream_protocol, client_model)
+    };
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>(128);
     let tag_owned = tag.to_string();
