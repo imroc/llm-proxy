@@ -372,9 +372,17 @@ pub async fn handle_request(
         request_body.len()
     );
 
+    // Detailed routing info for debugging
+    let model_mapping = match &route_config.upstream_model {
+        Some(um) if um != model_str => format!(" model={}→{}", model_str, um),
+        _ => format!(" model={}", model_str),
+    };
     tracing::debug!(
-        "{} upstream URL: {} body={}bytes",
+        "{} {} {}{} {} body={}bytes",
         tag,
+        method,
+        path,
+        model_mapping,
         upstream_url,
         request_body.len()
     );
@@ -615,7 +623,14 @@ async fn build_non_streaming_response(
     let resp_headers = strip_response_hop_by_hop(response.headers());
     let body_bytes = response.bytes().await.unwrap_or_default();
 
-    // Debug log non-200 responses
+    tracing::debug!(
+        "{} upstream {} | response body={}bytes",
+        tag,
+        status,
+        body_bytes.len()
+    );
+
+    // Debug log non-200 response bodies
     if !status.is_success() {
         let body_preview = String::from_utf8_lossy(&body_bytes);
         let p = if body_preview.len() > 1000 {
@@ -674,6 +689,8 @@ async fn build_streaming_response(
     let status = response.status();
     let resp_headers = strip_response_hop_by_hop(response.headers());
     let start_time = Instant::now();
+
+    tracing::debug!("{} upstream {} | streaming", tag, status);
 
     // Only apply stream transform on 2xx success. Error responses passthrough.
     let mut stream_transformer = if status.is_success() {
