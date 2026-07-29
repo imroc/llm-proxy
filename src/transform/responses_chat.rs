@@ -1025,6 +1025,10 @@ fn append_responses_item_as_chat_message(
             let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
             let role = if role == "developer" { "system" } else { role };
             let content = responses_content_to_chat_text(item);
+            // Skip empty assistant messages (e.g., reasoning-only responses with no text)
+            if role == "assistant" && content.is_empty() {
+                return;
+            }
             messages.push(json!({"role": role, "content": content}));
         }
         Some("local_shell_call") | Some("custom_tool_call") | Some("function_call") => {
@@ -1044,6 +1048,8 @@ fn append_responses_item_as_chat_message(
             flush_pending_tool_calls(messages, pending_tool_calls);
             let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
             let output = item.get("output").and_then(|v| v.as_str()).unwrap_or("");
+            // Ensure tool content is non-empty (some APIs reject empty tool results)
+            let output = if output.is_empty() { "(empty)" } else { output };
             messages.push(json!({"role": "tool", "tool_call_id": call_id, "content": output}));
         }
         // Item without a recognized type — try role-based handling
@@ -1057,6 +1063,9 @@ fn append_responses_item_as_chat_message(
                 // but many third-party APIs only accept "system")
                 let role = if role == "developer" { "system" } else { role };
                 let content = responses_content_to_chat_text(item);
+                if role == "assistant" && content.is_empty() {
+                    return;
+                }
                 messages.push(json!({"role": role, "content": content}));
             } else if let Some(text) = item.as_str() {
                 // Bare string input
