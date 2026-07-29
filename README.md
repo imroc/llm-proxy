@@ -2,23 +2,29 @@
 
 [中文文档](./README.zh-CN.md)
 
-A thin local proxy for LLM APIs with automatic retry, protocol transform, and model-level routing. Designed for team-shared API scenarios where rate limiting (429) frequently interrupts AI CLI tool sessions.
+A thin local proxy for LLM APIs with automatic retry, flexible protocol conversion, and model-level routing. Designed for team-shared API scenarios where rate limiting (429) frequently interrupts AI CLI tool sessions.
 
 ## Why?
 
-When using AI CLI tools (CodeBuddy Code, Claude Code, Codex CLI, OpenCode) with team-shared model APIs, global rate limits cause 429 errors that interrupt sessions. Most CLI tools have limited or no retry capability, requiring manual "continue" to resume work.
+When using AI CLI tools (CodeBuddy Code, Claude Code, Codex CLI) with team-shared model APIs, global rate limits cause 429 errors that interrupt sessions. Most CLI tools have limited or no retry capability, requiring manual "continue" to resume work.
 
 This proxy sits between the CLI tool and the API, transparently retrying requests that receive 429/5xx errors with exponential backoff + jitter, so the CLI tool never sees the error.
+
+It also solves a second problem: different AI tools use different API protocols (OpenAI Responses, Chat Completions, Anthropic Messages), but upstream providers often only support one. The proxy automatically detects the inbound protocol and converts it to whatever the upstream supports — no manual transform configuration needed.
 
 ## Features
 
 - **Unlimited retry** — keeps retrying until the client disconnects or succeeds
-- **Protocol-agnostic** — works with OpenAI, Anthropic Messages, and any HTTP API format
+- **Flexible protocol conversion** — auto-detects inbound format (Responses/Chat/Anthropic) and converts to any supported upstream format
+- **Default route** — all AI tools point to the same address; the `model` field in the request body determines the upstream target
+- **API key management** — per-model API keys with `${ENV_VAR}` expansion, independent of client-side keys
+- **Model name mapping** — automatic bidirectional model name rewriting (`upstream_model`)
+- **GET /v1/models** — returns all configured models for client-side model discovery
 - **Transparent** — CLI tools don't need any retry support; just point them at the proxy
-- **Streaming support** — SSE streaming passthrough without buffering
+- **Streaming support** — SSE streaming passthrough and real-time protocol conversion
 - **Client-aware** — detects client disconnect immediately (even during backoff) and stops retrying
-- **Hot-reload config** — add/remove routes without restart
-- **Model-level routing** — route different models to different upstreams within a single route, enabling single-provider multi-model scenarios for tools like Codex
+- **Hot-reload config** — add/remove routes and models without restart
+- **Tool call history cache** — handles `previous_response_id` across protocol conversion
 - **Prometheus metrics** — monitor retry rates and upstream status (per route + model)
 - **Single binary** — low memory footprint, written in Rust
 
@@ -36,9 +42,7 @@ cp config.example.toml config.toml
 ./target/release/llm-proxy --config config.toml --log-level info
 ```
 
-Point your AI CLI tool's API URL to `http://127.0.0.1:8888/{route_name}/{api_path}`.
-
-See [docs/tools/](./docs/tools/) for configuration guides for specific AI CLI tools.
+Point your AI CLI tool's API URL to `http://127.0.0.1:8888` (default route) or `http://127.0.0.1:8888/{route_name}/{api_path}` (named route).
 
 ## Configuration
 
@@ -51,46 +55,75 @@ max_total_wait_ms = 0        # 0 = rely on client disconnect
 connect_timeout_secs = 30
 retry_status_codes = [429, 500, 502, 503, 504, 408, 529]
 
-[routes.myapi]
-target = "https://api.example.com"
-# Route-level overrides (all optional):
-# max_retries = 500
-# base_delay_ms = 2000
-# max_delay_ms = 30000
+# Named route: URL path starts with /tkehub/...
+[routes.tkehub]
+target = "http://tkehub.woa.com"
+
+# Default route: URL without route name, model field determines upstream
+[routes.default]
+
+# Each model has its own target, API key, and supported formats
+[routes.default.models."my-glm"]
+target = "http://tkehub.woa.com"
+upstream_formats = ["responses", "chat"]  # what the upstream supports
+api_key = "${TKEHUB_API_KEY}"              # env var expansion
+upstream_model = "tke/glm-latest"         # rewrite model name for upstream
+
+[routes.default.models."my-deepseek"]
+target = "https://tokenhub.tencentmaas.com"
+upstream_formats = ["chat"]               # only supports chat
+api_key = "${DEEPSEEK_API_KEY}"
+upstream_model = "deepseek-chat"
 ```
 
 See [config.example.toml](./config.example.toml) for a complete example.
 
-### Model-level Routing
+### Protocol Auto-Detection
 
-When the request body contains a `model` field, the proxy looks it up in the route's `models` map. If found, model-level config overrides the route-level config. This enables a single route (provider) to manage multiple models from different upstreams — ideal for AI CLI tools that only allow model switching within the same provider.
+The proxy detects the inbound protocol from the URL path:
 
-```toml
-[routes.tkehub]
-target = "http://tkehub.woa.com"
-transform = "responses_to_chat"  # route-level default
+| URL Path | Protocol |
+|----------|----------|
+| `/v1/responses` | OpenAI Responses API |
+| `/v1/chat/completions` | OpenAI Chat Completions |
+| `/v1/messages` | Anthropic Messages |
 
-# GLM supports Responses API natively — direct passthrough, no transform
-[routes.tkehub.models."tke/glm-latest"]
-transform = "none"
+### `upstream_formats`
 
-# DeepSeek goes to a different upstream with model name mapping
-[routes.tkehub.models."tke/deepseek-flash-latest"]
-target = "https://tokenhub.tencentmaas.com"
-upstream_model = "deepseek-chat"
-rewrite_response_model = true
-max_delay_ms = 30000
-```
+Declare what the upstream supports, ordered by preference. The proxy auto-decides:
 
-Model-level fields (all optional — only specified fields override):
+- If the inbound format **is in** the list → **passthrough** (no conversion)
+- If the inbound format **is not in** the list → **convert** to the first format in the list
+- Empty (unset) → passthrough anything
+
+This replaces the old `transform` field. No more manual transform configuration — the proxy infers the conversion direction automatically.
+
+### Default Route
+
+The default route (`routes.default`) enables unified access: all AI CLI tools point to the same address (`http://127.0.0.1:8888`), and the `model` field in the request body determines which upstream to use. Each model can have its own target, API key, and supported formats.
+
+Named routes and the default route coexist — named routes are matched first (first URL path segment), then the default route catches everything else.
+
+### Model-Level Fields
+
+All fields are optional — only specified fields override the route-level config.
 
 | Field | Description |
 |-------|-------------|
-| `target` | Upstream API URL |
-| `transform` | `"responses_to_chat"` or `"none"` to explicitly disable |
-| `upstream_model` | Rewrite the `model` field in the request body |
-| `rewrite_response_model` | Rewrite the `model` field in responses back to the client's model name (default: false) |
+| `target` | Upstream base URL (proxy auto-appends standard API path) |
+| `upstream_formats` | List of protocols the upstream supports, ordered by preference |
+| `api_key` | API key for the upstream (supports `${ENV_VAR}` expansion) |
+| `upstream_model` | Rewrite the `model` field in requests; auto-rewrite responses back |
 | retry params | `max_retries`, `base_delay_ms`, `max_delay_ms`, `max_total_wait_ms`, `connect_timeout_secs`, `retry_status_codes` |
+
+### API Key Management
+
+When `api_key` is configured at the model or route level, the proxy:
+1. Strips the client's `Authorization` header
+2. Injects the configured API key (with `${ENV_VAR}` expansion)
+3. Forwards to the upstream
+
+When no `api_key` is configured (named routes without `api_key`), the client's original `Authorization` header is forwarded as-is (backward compatible).
 
 ## Installation
 
