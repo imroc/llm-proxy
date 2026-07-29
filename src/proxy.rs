@@ -360,6 +360,18 @@ pub async fn handle_request(
         body_bytes.clone()
     };
 
+    let conversion_desc = match conversion {
+        Some((from, to)) => format!("{}→{}", from, to),
+        None => "passthrough".to_string(),
+    };
+    info!(
+        "{} -> {} {} (body={} bytes)",
+        tag,
+        upstream_url,
+        conversion_desc,
+        request_body.len()
+    );
+
     tracing::debug!(
         "{} upstream URL: {} body={}bytes",
         tag,
@@ -520,7 +532,7 @@ pub async fn handle_request(
                     )
                     .await;
                 } else {
-                    return build_non_streaming_response(
+                    let resp = build_non_streaming_response(
                         response,
                         upstream_protocol,
                         inbound_protocol,
@@ -529,6 +541,14 @@ pub async fn handle_request(
                         &upstream_url,
                     )
                     .await;
+                    info!(
+                        "{} -> {} {} ({}ms)",
+                        tag,
+                        upstream_url,
+                        resp.status(),
+                        duration.as_millis()
+                    );
+                    return resp;
                 }
             }
             Err(e) => {
@@ -653,6 +673,7 @@ async fn build_streaming_response(
 ) -> Response<ResponseBody> {
     let status = response.status();
     let resp_headers = strip_response_hop_by_hop(response.headers());
+    let start_time = Instant::now();
 
     // Only apply stream transform on 2xx success. Error responses passthrough.
     let mut stream_transformer = if status.is_success() {
@@ -714,6 +735,12 @@ async fn build_streaming_response(
 
         // Signal end of stream
         let _ = tx.send(Ok(Bytes::new())).await;
+        info!(
+            "{} -> {} stream completed ({}ms)",
+            tag_owned,
+            upstream_url_owned,
+            start_time.elapsed().as_millis()
+        );
         drop(tag_owned);
         drop(upstream_url_owned);
     });
