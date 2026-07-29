@@ -88,15 +88,15 @@ fn match_route(path: &str, config: &Config) -> RouteMatch {
     }
 }
 
-fn build_forward_headers(req_headers: &HeaderMap) -> HeaderMap {
+fn build_forward_headers(req_headers: &HeaderMap, has_config_api_key: bool) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for (key, value) in req_headers {
         let lower = key.as_str().to_lowercase();
         if HOP_BY_HOP_REQUEST.contains(&lower.as_str()) {
             continue;
         }
-        // Drop Authorization — we use config-level api_key
-        if lower == "authorization" {
+        // Drop Authorization only when a config-level api_key will replace it
+        if has_config_api_key && lower == "authorization" {
             continue;
         }
         headers.insert(key.clone(), value.clone());
@@ -232,7 +232,7 @@ pub async fn handle_request(
     };
 
     // Extract headers before consuming body
-    let forward_headers = build_forward_headers(req.headers());
+    let forward_headers = build_forward_headers(req.headers(), route_config.api_key.is_some());
 
     // Read full request body
     let has_body = method != Method::GET && method != Method::HEAD;

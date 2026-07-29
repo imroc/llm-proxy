@@ -1,0 +1,28 @@
+[defaults]
+max_retries = 9999
+base_delay_ms = 1000
+max_delay_ms = 60000
+connect_timeout_secs = 30
+retry_status_codes = [429, 500, 502, 503, 504, 408, 529]
+
+# Default route: unified access for all AI tools
+[routes.default]
+
+# GLM: upstream supports responses natively
+[routes.default.models."tkehub-glm"]
+target = "http://tkehub.woa.com"
+upstream_formats = ["responses"]
+api_key = "${TKEHUB_API_KEY}"
+upstream_model = "tke/glm-latest"
+
+# DeepSeek: upstream only supports chat
+[routes.default.models."tkehub-deepseek"]
+target = "http://tkehub.woa.com"
+upstream_formats = ["chat"]
+api_key = "${TKEHUB_API_KEY}"
+upstream_model = "tke/deepseek-flash-latest"
+
+# Named route for backward compatibility
+[routes.tkehub]
+target = "http://tkehub.woa.com"
+upstream_formats = ["responses"]
