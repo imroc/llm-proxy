@@ -1024,9 +1024,14 @@ fn append_responses_item_as_chat_message(
             flush_pending_tool_calls(messages, pending_tool_calls);
             let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
             let role = if role == "developer" { "system" } else { role };
-            let content = responses_content_to_chat_text(item);
+            let content = responses_content_to_chat_content(item);
             // Skip empty assistant messages (e.g., reasoning-only responses with no text)
-            if role == "assistant" && content.is_empty() {
+            let is_empty = match &content {
+                Value::String(s) => s.is_empty(),
+                Value::Array(arr) => arr.is_empty(),
+                _ => false,
+            };
+            if role == "assistant" && is_empty {
                 return;
             }
             messages.push(json!({"role": role, "content": content}));
@@ -1062,8 +1067,13 @@ fn append_responses_item_as_chat_message(
                 // (OpenAI introduced "developer" as a replacement for "system",
                 // but many third-party APIs only accept "system")
                 let role = if role == "developer" { "system" } else { role };
-                let content = responses_content_to_chat_text(item);
-                if role == "assistant" && content.is_empty() {
+                let content = responses_content_to_chat_content(item);
+                let is_empty = match &content {
+                    Value::String(s) => s.is_empty(),
+                    Value::Array(arr) => arr.is_empty(),
+                    _ => false,
+                };
+                if role == "assistant" && is_empty {
                     return;
                 }
                 messages.push(json!({"role": role, "content": content}));
@@ -1086,24 +1096,66 @@ fn flush_pending_tool_calls(messages: &mut Vec<Value>, pending_tool_calls: &mut 
     messages.push(json!({"role": "assistant", "tool_calls": tool_calls}));
 }
 
-fn responses_content_to_chat_text(item: &Value) -> String {
+/// Convert Responses API content to Chat Completions content.
+/// Returns a string for text-only content, or an array for multimodal content
+/// (preserving image data as proper `image_url` parts instead of dropping them).
+fn responses_content_to_chat_content(item: &Value) -> Value {
     match item.get("content") {
-        Some(Value::String(s)) => s.clone(),
+        Some(Value::String(s)) => Value::String(s.clone()),
         Some(Value::Array(parts)) => {
-            let texts: Vec<&str> = parts
+            let has_image = parts
                 .iter()
-                .filter_map(|c| {
-                    let ct = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    match ct {
-                        "input_text" | "output_text" => c.get("text").and_then(|v| v.as_str()),
-                        "input_image" => Some("[image]"),
-                        _ => c.get("text").and_then(|v| v.as_str()),
-                    }
-                })
-                .collect();
-            texts.join("\n")
+                .any(|c| c.get("type").and_then(|v| v.as_str()) == Some("input_image"));
+
+            if !has_image {
+                // Text-only: join as plain string for broad compatibility
+                let texts: Vec<&str> = parts
+                    .iter()
+                    .filter_map(|c| {
+                        let ct = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        match ct {
+                            "input_text" | "output_text" => c.get("text").and_then(|v| v.as_str()),
+                            _ => c.get("text").and_then(|v| v.as_str()),
+                        }
+                    })
+                    .collect();
+                Value::String(texts.join("\n"))
+            } else {
+                // Multimodal: return content array with proper image_url parts
+                let content_parts: Vec<Value> = parts
+                    .iter()
+                    .filter_map(|c| {
+                        let ct = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        match ct {
+                            "input_text" | "output_text" => c
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .map(|text| json!({"type": "text", "text": text})),
+                            "input_image" => {
+                                // Responses API: input_image has image_url (string) or file_id
+                                // Chat Completions: image_url has {url: string, detail?: string}
+                                if let Some(url) = c.get("image_url").and_then(|v| v.as_str()) {
+                                    let mut image_url = json!({"url": url});
+                                    if let Some(detail) = c.get("detail").and_then(|v| v.as_str()) {
+                                        image_url["detail"] = json!(detail);
+                                    }
+                                    Some(json!({"type": "image_url", "image_url": image_url}))
+                                } else {
+                                    // file_id or other format without image_url — cannot convert, skip
+                                    None
+                                }
+                            }
+                            _ => c
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .map(|text| json!({"type": "text", "text": text})),
+                        }
+                    })
+                    .collect();
+                Value::Array(content_parts)
+            }
         }
-        _ => String::new(),
+        _ => Value::String(String::new()),
     }
 }
 

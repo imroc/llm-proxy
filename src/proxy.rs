@@ -379,11 +379,11 @@ pub async fn handle_request(
                             .and_then(|t| t.as_array())
                             .map(|a| a.len())
                             .unwrap_or(0);
-                        let clen = m
-                            .get("content")
-                            .and_then(|c| c.as_str())
-                            .map(|s| s.len())
-                            .unwrap_or(0);
+                        let clen = match m.get("content") {
+                            Some(serde_json::Value::String(s)) => s.len(),
+                            Some(serde_json::Value::Array(arr)) => arr.len(),
+                            _ => 0,
+                        };
                         format!("msg[{}]:role={}:tc={}:len={}", i, role, tc, clen)
                     })
                     .collect();
