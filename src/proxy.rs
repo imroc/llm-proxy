@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{info, trace, warn};
 
 use crate::config::{Config, DEFAULT_ROUTE};
 use crate::format::{self, Protocol};
@@ -685,9 +685,10 @@ async fn build_streaming_response(
                         if let Some(output) = transformed {
                             if tx.send(Ok(Bytes::from(output))).await.is_err() {
                                 // Client disconnected
-                                debug!(
+                                trace!(
                                     "{} -> {} client disconnected during streaming",
-                                    tag_owned, upstream_url_owned
+                                    tag_owned,
+                                    upstream_url_owned
                                 );
                                 break;
                             }
