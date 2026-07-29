@@ -6,11 +6,11 @@
 
 ## 为什么需要？
 
-使用 AI CLI 工具（CodeBuddy Code、Claude Code、Codex CLI）连接团队共享模型 API 时，全局限频会导致 429 错误中断会话。大多数 CLI 工具的重试能力有限或没有，需��手动 "continue" 恢复工作。
+使用 AI CLI 工具（CodeBuddy Code、Claude Code、Codex CLI）连接团队共享模型 API 时，全局限频会导致 429 错误中断会话。大多数 CLI 工具的重试能力有限或没有，需手动 "continue" 恢复工作。
 
 本代理位于 CLI 工具和 API 之间，对收到 429/5xx 错误的请求进行指数退避 + 抖动的透明重试，CLI 工具完全无感知。
 
-同时解决第二个问题：不同 AI 工具使用不同的 API 协议（OpenAI Responses、Chat Completions、Anthropic Messages），但上游通常只支持一种。代理自动检测入站协议并转换为上游支持的格式——无需手动配置转换。
+同时解决第二个问题：不同 AI 工具使用不同的 API 协议（OpenAI Responses、Chat Completions、Anthropic Messages），但上游通常没有全部支持。代理自动检测入站协议并转换为上游支持的格式——无需手动配置转换。
 
 ## 功能
 
@@ -82,11 +82,11 @@ upstream_model = "deepseek-chat"
 
 代理根据 URL 路径自动检测入站协议：
 
-| URL 路径 | 协议 |
-|----------|------|
-| `/v1/responses` | OpenAI Responses API |
+| URL 路径               | 协议                    |
+| ---------------------- | ----------------------- |
+| `/v1/responses`        | OpenAI Responses API    |
 | `/v1/chat/completions` | OpenAI Chat Completions |
-| `/v1/messages` | Anthropic Messages |
+| `/v1/messages`         | Anthropic Messages      |
 
 ### `upstream_formats`
 
@@ -108,17 +108,18 @@ upstream_model = "deepseek-chat"
 
 所有字段可选——仅指定的字段覆盖路由级配置。
 
-| 字段 | 说明 |
-|------|------|
-| `target` | 上游 base URL（代理自动拼接标准 API 路径） |
-| `upstream_formats` | 上游支持的协议列表，按优先级排序 |
-| `api_key` | 上游 API key（支持 `${ENV_VAR}` 环境变量展开） |
-| `upstream_model` | 改写请求中的 `model` 字段；响应自动回写为客户端原始模型名 |
-| 重试参数 | `max_retries`、`base_delay_ms`、`max_delay_ms`、`max_total_wait_ms`、`connect_timeout_secs`、`retry_status_codes` |
+| 字段               | 说明                                                                                                              |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `target`           | 上游 base URL（代理自动拼接标准 API 路径）                                                                        |
+| `upstream_formats` | 上游支持的协议列表，按优先级排序                                                                                  |
+| `api_key`          | 上游 API key（支持 `${ENV_VAR}` 环境变量展开）                                                                    |
+| `upstream_model`   | 改写请求中的 `model` 字段；响应自动回写为客户端原始模型名                                                         |
+| 重试参数           | `max_retries`、`base_delay_ms`、`max_delay_ms`、`max_total_wait_ms`、`connect_timeout_secs`、`retry_status_codes` |
 
 ### API Key 管理
 
 当 model 或 route 级别配置了 `api_key` 时，代理会：
+
 1. 剥离客户端的 `Authorization` header
 2. 注入配置的 API key（支持 `${ENV_VAR}` 环境变量展开）
 3. 转发给上游

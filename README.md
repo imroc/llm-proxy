@@ -10,7 +10,7 @@ When using AI CLI tools (CodeBuddy Code, Claude Code, Codex CLI) with team-share
 
 This proxy sits between the CLI tool and the API, transparently retrying requests that receive 429/5xx errors with exponential backoff + jitter, so the CLI tool never sees the error.
 
-It also solves a second problem: different AI tools use different API protocols (OpenAI Responses, Chat Completions, Anthropic Messages), but upstream providers often only support one. The proxy automatically detects the inbound protocol and converts it to whatever the upstream supports — no manual transform configuration needed.
+It also solves a second problem: different AI tools use different API protocols (OpenAI Responses, Chat Completions, Anthropic Messages), but upstream usually does not provide full support. The proxy automatically detects the inbound protocol and converts it to whatever the upstream supports — no manual transform configuration needed.
 
 ## Features
 
@@ -82,11 +82,11 @@ See [config.example.toml](./config.example.toml) for a complete example.
 
 The proxy detects the inbound protocol from the URL path:
 
-| URL Path | Protocol |
-|----------|----------|
-| `/v1/responses` | OpenAI Responses API |
+| URL Path               | Protocol                |
+| ---------------------- | ----------------------- |
+| `/v1/responses`        | OpenAI Responses API    |
 | `/v1/chat/completions` | OpenAI Chat Completions |
-| `/v1/messages` | Anthropic Messages |
+| `/v1/messages`         | Anthropic Messages      |
 
 ### `upstream_formats`
 
@@ -108,17 +108,18 @@ Named routes and the default route coexist — named routes are matched first (f
 
 All fields are optional — only specified fields override the route-level config.
 
-| Field | Description |
-|-------|-------------|
-| `target` | Upstream base URL (proxy auto-appends standard API path) |
-| `upstream_formats` | List of protocols the upstream supports, ordered by preference |
-| `api_key` | API key for the upstream (supports `${ENV_VAR}` expansion) |
-| `upstream_model` | Rewrite the `model` field in requests; auto-rewrite responses back |
-| retry params | `max_retries`, `base_delay_ms`, `max_delay_ms`, `max_total_wait_ms`, `connect_timeout_secs`, `retry_status_codes` |
+| Field              | Description                                                                                                       |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `target`           | Upstream base URL (proxy auto-appends standard API path)                                                          |
+| `upstream_formats` | List of protocols the upstream supports, ordered by preference                                                    |
+| `api_key`          | API key for the upstream (supports `${ENV_VAR}` expansion)                                                        |
+| `upstream_model`   | Rewrite the `model` field in requests; auto-rewrite responses back                                                |
+| retry params       | `max_retries`, `base_delay_ms`, `max_delay_ms`, `max_total_wait_ms`, `connect_timeout_secs`, `retry_status_codes` |
 
 ### API Key Management
 
 When `api_key` is configured at the model or route level, the proxy:
+
 1. Strips the client's `Authorization` header
 2. Injects the configured API key (with `${ENV_VAR}` expansion)
 3. Forwards to the upstream
