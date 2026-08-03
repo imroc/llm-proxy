@@ -649,7 +649,7 @@ fn close_msg_item(state: &mut ChatToResponsesStreamState) -> String {
     out
 }
 
-fn flush_stream_completion(state: &mut ChatToResponsesStreamState) -> Option<String> {
+pub fn flush_stream_completion(state: &mut ChatToResponsesStreamState) -> Option<String> {
     if state.completed {
         return None;
     }
@@ -944,6 +944,49 @@ pub fn responses_sse_to_chat_sse(
     } else {
         Some(output)
     }
+}
+
+/// Flush a Responses→Chat stream that ended without `response.completed`.
+/// Emits a final chat chunk with `finish_reason` and `[DONE]` so the client
+/// receives a properly terminated stream even when the upstream dropped the
+/// connection mid-stream (e.g. kimi-k3 long reasoning cut short).
+pub fn flush_responses_to_chat(state: &mut ResponsesToChatStreamState) -> Option<String> {
+    if state.completed {
+        return None;
+    }
+    state.completed = true;
+
+    let mut output = String::new();
+    if !state.headers_emitted {
+        state.headers_emitted = true;
+        output.push_str(&sse_line(&json!({
+            "id": state.chat_id,
+            "object": "chat.completion.chunk",
+            "created": state.created,
+            "model": &state.model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}],
+        })));
+    }
+
+    let finish_reason = if !state.active_tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    output.push_str(&sse_line(&json!({
+        "id": state.chat_id,
+        "object": "chat.completion.chunk",
+        "created": state.created,
+        "model": &state.model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+        "usage": {
+            "prompt_tokens": state.total_input,
+            "completion_tokens": state.total_output,
+            "total_tokens": state.total_input + state.total_output,
+        },
+    })));
+    output.push_str("data: [DONE]\n\n");
+    Some(output)
 }
 
 // ── Helper functions ───────────────────────────────────────────────────────
@@ -1312,5 +1355,49 @@ mod tests {
         assert_eq!(result["object"], "chat.completion");
         let choices = result["choices"].as_array().unwrap();
         assert_eq!(choices[0]["message"]["content"], "Hi there!");
+    }
+
+    #[test]
+    fn test_flush_responses_to_chat_incomplete() {
+        // Simulate a Responses→Chat stream that ends mid-way (upstream dropped
+        // the connection before `response.completed`). Flush must emit a final
+        // chunk with `finish_reason` + `[DONE]` and only once.
+        let mut state = ResponsesToChatStreamState::new("test");
+
+        // Feed some text first
+        let out1 = responses_sse_to_chat_sse(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n",
+            &mut state,
+        )
+        .unwrap();
+        assert!(out1.contains("hello"));
+
+        // Flush the incomplete stream
+        let out2 = flush_responses_to_chat(&mut state).unwrap();
+        assert!(out2.contains("\"finish_reason\":\"stop\""));
+        assert!(out2.contains("data: [DONE]"));
+
+        // Second flush must be a no-op
+        assert!(flush_responses_to_chat(&mut state).is_none());
+    }
+
+    #[test]
+    fn test_flush_chat_to_responses_incomplete() {
+        // Simulate a Chat→Responses stream that ends without `[DONE]`.
+        // Flush must emit `response.completed` + `[DONE]`.
+        let mut state = ChatToResponsesStreamState::new("test");
+
+        let out1 = chat_sse_to_responses_sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n",
+            &mut state,
+        )
+        .unwrap();
+        assert!(!out1.is_empty());
+
+        let out2 = flush_stream_completion(&mut state).unwrap();
+        assert!(out2.contains("response.completed"));
+        assert!(out2.contains("data: [DONE]"));
+
+        assert!(flush_stream_completion(&mut state).is_none());
     }
 }

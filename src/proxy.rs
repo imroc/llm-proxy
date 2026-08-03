@@ -750,6 +750,15 @@ async fn build_streaming_response(
             }
         }
 
+        // If the upstream stream ended without a proper termination event
+        // (e.g. connection dropped mid-stream without `[DONE]` /
+        // `response.completed` / `message_stop`), flush the transformer to
+        // emit a well-formed completion so the client doesn't treat the
+        // response as a silently finished turn.
+        if let Some(output) = stream_transformer.flush_if_incomplete() {
+            let _ = tx.send(Ok(Bytes::from(output))).await;
+        }
+
         // Signal end of stream
         let _ = tx.send(Ok(Bytes::new())).await;
         info!(

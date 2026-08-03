@@ -231,4 +231,38 @@ impl StreamTransformer {
     pub fn is_passthrough(&self) -> bool {
         matches!(self, StreamTransformer::Passthrough { .. })
     }
+
+    /// Flush any pending completion state when the upstream stream ends
+    /// without a proper termination event (e.g. connection dropped mid-stream).
+    ///
+    /// Returns SSE lines to send to the client, or `None` if nothing to emit
+    /// (either already completed, or passthrough mode).
+    ///
+    /// This prevents the client from receiving an unterminated stream (missing
+    /// `response.completed` / `[DONE]` / `message_stop`), which some clients
+    /// (e.g. Codex CLI) interpret as a silently finished turn, causing
+    /// incomplete responses without any visible error.
+    pub fn flush_if_incomplete(&mut self) -> Option<String> {
+        match self {
+            StreamTransformer::Passthrough { .. } => None,
+            StreamTransformer::ChatToResponses { state } => {
+                responses_chat::flush_stream_completion(state)
+            }
+            StreamTransformer::ResponsesToChat { state } => {
+                responses_chat::flush_responses_to_chat(state)
+            }
+            StreamTransformer::AnthropicToResponses { state } => {
+                responses_anthropic::flush_anthropic_to_responses(state)
+            }
+            StreamTransformer::ResponsesToAnthropic { state } => {
+                responses_anthropic::flush_responses_to_anthropic(state)
+            }
+            StreamTransformer::AnthropicToChat { state } => {
+                chat_anthropic::flush_anthropic_to_chat(state)
+            }
+            StreamTransformer::ChatToAnthropic { state } => {
+                chat_anthropic::flush_chat_to_anthropic(state)
+            }
+        }
+    }
 }

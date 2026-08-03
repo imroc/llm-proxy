@@ -464,6 +464,64 @@ pub fn anthropic_sse_to_chat_sse(
     }
 }
 
+/// Flush an Anthropic→Chat stream that ended without `message_stop`.
+/// Emits a final chat chunk with `finish_reason` + `[DONE]` so the client
+/// receives a properly terminated stream.
+pub fn flush_anthropic_to_chat(state: &mut AnthropicToChatStreamState) -> Option<String> {
+    if state.completed {
+        return None;
+    }
+    state.completed = true;
+
+    let mut output = String::new();
+    if !state.headers_emitted {
+        state.headers_emitted = true;
+        output.push_str(&sse_line(&json!({
+            "id": state.chat_id, "object": "chat.completion.chunk", "created": state.created, "model": &state.model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}],
+        })));
+    }
+    output.push_str(&sse_line(&json!({
+        "id": state.chat_id, "object": "chat.completion.chunk", "created": state.created, "model": &state.model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": state.total_input, "completion_tokens": state.total_output,
+            "total_tokens": state.total_input + state.total_output},
+    })));
+    output.push_str("data: [DONE]\n\n");
+    Some(output)
+}
+
+/// Flush a Chat→Anthropic stream that ended without `[DONE]`.
+/// Emits `content_block_stop` + `message_delta` + `message_stop` so the client
+/// receives a properly terminated Anthropic stream.
+pub fn flush_chat_to_anthropic(state: &mut ChatToAnthropicStreamState) -> Option<String> {
+    if state.completed {
+        return None;
+    }
+    state.completed = true;
+
+    let mut output = String::new();
+    if !state.headers_emitted {
+        state.headers_emitted = true;
+        output.push_str(&sse_line(&json!({
+            "type": "message_start",
+            "message": {"id": state.msg_id, "type": "message", "role": "assistant",
+                "model": &state.model, "content": [], "stop_reason": null,
+                "usage": {"input_tokens": 0, "output_tokens": 0}},
+        })));
+    }
+    if state.content_block_started {
+        output.push_str(&sse_line(
+            &json!({"type": "content_block_stop", "index": 0}),
+        ));
+    }
+    output.push_str(&sse_line(&json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}})));
+    output.push_str(&sse_line(
+        &json!({"type": "message_stop", "usage": {"input_tokens": 0, "output_tokens": 0}}),
+    ));
+    Some(output)
+}
+
 /// Convert Chat Completions SSE to Anthropic SSE.
 pub fn chat_sse_to_anthropic_sse(
     line: &str,

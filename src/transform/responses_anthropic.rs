@@ -596,6 +596,86 @@ pub fn responses_sse_to_anthropic_sse(
     }
 }
 
+/// Flush an Anthropic→Responses stream that ended without `message_stop`.
+/// Emits `response.completed` + `[DONE]` so the client receives a properly
+/// terminated responses stream even when the upstream dropped mid-stream.
+pub fn flush_anthropic_to_responses(state: &mut AnthropicToResponsesStreamState) -> Option<String> {
+    if state.completed {
+        return None;
+    }
+    state.completed = true;
+
+    let mut output = String::new();
+    if !state.msg_closed {
+        state.msg_closed = true;
+        output.push_str(&super::common::sse_line(&json!({
+            "type": "response.content_part.done", "output_index": 0, "content_index": 0,
+            "part": {"type": "output_text", "text": state.full_text, "annotations": []},
+        })));
+        output.push_str(&super::common::sse_line(&json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"id": state.msg_id, "type": "message", "role": "assistant", "status": "completed",
+                "content": [{"type": "output_text", "text": state.full_text, "annotations": []}]},
+        })));
+    }
+
+    output.push_str(&super::common::sse_line(&json!({
+        "type": "response.completed",
+        "response": {
+            "id": state.resp_id, "object": "response", "created_at": state.created,
+            "status": "completed", "model": &state.model,
+            "output": [{"id": state.msg_id, "type": "message", "role": "assistant", "status": "completed",
+                "content": [{"type": "output_text", "text": state.full_text, "annotations": []}]}],
+            "usage": {"input_tokens": state.total_input, "output_tokens": state.total_output,
+                "total_tokens": state.total_input + state.total_output},
+            "parallel_tool_calls": true, "previous_response_id": null,
+            "reasoning": {"effort": "medium", "summary": "auto"},
+            "text": {"format": {"type": "text"}}, "tools": [], "truncation": "disabled",
+        },
+    })));
+    output.push_str("data: [DONE]\n\n");
+    Some(output)
+}
+
+/// Flush a Responses→Anthropic stream that ended without `response.completed`.
+/// Emits `content_block_stop` + `message_delta` + `message_stop` so the client
+/// receives a properly terminated Anthropic stream.
+pub fn flush_responses_to_anthropic(state: &mut ResponsesToAnthropicStreamState) -> Option<String> {
+    if state.completed {
+        return None;
+    }
+    state.completed = true;
+
+    let mut output = String::new();
+    if !state.headers_emitted {
+        state.headers_emitted = true;
+        output.push_str(&super::common::sse_line(&json!({
+            "type": "message_start",
+            "message": {"id": state.msg_id, "type": "message", "role": "assistant",
+                "model": &state.model, "content": [], "stop_reason": null,
+                "usage": {"input_tokens": 0, "output_tokens": 0}},
+        })));
+        output.push_str(&super::common::sse_line(&json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        })));
+    }
+
+    output.push_str(&super::common::sse_line(
+        &json!({"type": "content_block_stop", "index": 0}),
+    ));
+    output.push_str(&super::common::sse_line(&json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn"},
+        "usage": {"output_tokens": 0},
+    })));
+    output.push_str(&super::common::sse_line(&json!({
+        "type": "message_stop",
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    })));
+    Some(output)
+}
+
 fn extract_text_from_responses_content(item: &Value) -> String {
     match item.get("content") {
         Some(serde_json::Value::String(s)) => s.clone(),
