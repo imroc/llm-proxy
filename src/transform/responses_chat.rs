@@ -1136,6 +1136,28 @@ fn flush_pending_tool_calls(messages: &mut Vec<Value>, pending_tool_calls: &mut 
         return;
     }
     let tool_calls = std::mem::take(pending_tool_calls);
+
+    // Merge tool_calls into the last message if it's an assistant message
+    // without tool_calls (same turn: text + tool calls are emitted by the
+    // model together, and responses format splits them into separate items).
+    //
+    // Keeping text and tool_calls in separate consecutive assistant messages
+    // breaks some upstreams (e.g. tokenhub/kimi-k3): the model becomes
+    // unreliable in follow-up sampling and tends to end the turn early with a
+    // short text response instead of calling tools again ("silent stop").
+    if let Some(last) = messages.last_mut() {
+        let is_assistant_without_tool_calls = last
+            .get("role")
+            .and_then(|v| v.as_str())
+            .map(|r| r == "assistant")
+            .unwrap_or(false)
+            && last.get("tool_calls").is_none();
+        if is_assistant_without_tool_calls {
+            last["tool_calls"] = json!(tool_calls);
+            return;
+        }
+    }
+
     messages.push(json!({"role": "assistant", "tool_calls": tool_calls}));
 }
 
@@ -1399,5 +1421,47 @@ mod tests {
         assert!(out2.contains("data: [DONE]"));
 
         assert!(flush_stream_completion(&mut state).is_none());
+    }
+
+    #[test]
+    fn test_assistant_text_and_tool_calls_merged() {
+        // Codex responses input: assistant text message followed by function
+        // calls and outputs. The chat conversion must merge text + tool_calls
+        // into ONE assistant message (not two separate consecutive ones),
+        // otherwise upstreams like kimi-k3 become unreliable (silent stop).
+        let input = json!([
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "do the task"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "let me check"}]},
+            {"type": "function_call", "call_id": "call_1", "id": "call_1", "name": "exec_command", "arguments": "{\"cmd\":\"ls\"}", "status": "completed"},
+            {"type": "function_call", "call_id": "call_2", "id": "call_2", "name": "exec_command", "arguments": "{\"cmd\":\"pwd\"}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "file1"},
+            {"type": "function_call_output", "call_id": "call_2", "output": "/root"},
+        ]);
+        let body = json!({"model": "test", "input": input});
+        let result = request_responses_to_chat(&body).unwrap();
+        let msgs = result["messages"].as_array().unwrap();
+
+        // Find the assistant message with tool_calls and verify it also
+        // carries the text content (merged, not split).
+        let merged = msgs
+            .iter()
+            .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+            .find(|m| m.get("tool_calls").is_some())
+            .expect("assistant message with tool_calls should exist");
+        assert_eq!(merged["content"], "let me check");
+        let tcs = merged["tool_calls"].as_array().unwrap();
+        assert_eq!(tcs.len(), 2);
+
+        // Ensure no standalone assistant text message immediately precedes it
+        // as a separate message (would break upstreams).
+        let assistant_msgs: Vec<&Value> = msgs
+            .iter()
+            .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+            .collect();
+        assert_eq!(
+            assistant_msgs.len(),
+            1,
+            "text and tool_calls must be merged into one assistant message"
+        );
     }
 }
