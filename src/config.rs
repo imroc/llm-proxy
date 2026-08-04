@@ -61,6 +61,16 @@ impl Default for Defaults {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelConfig {
     pub target: Option<String>,
+    /// Alternative base URL for Anthropic Messages protocol.
+    /// When the upstream uses a different endpoint for Anthropic format
+    /// (e.g. `https://api.example.com/anthropic`), set this field.
+    /// Falls back to `target` when not set.
+    #[serde(default)]
+    pub anthropic_target: Option<String>,
+    /// Model name aliases. Client requests using any alias are routed
+    /// to this model entry. The canonical name is the TOML key.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     /// Upstream-supported protocol formats, ordered by preference.
     /// Empty (unset) means "accept anything, passthrough".
     #[serde(default)]
@@ -121,6 +131,7 @@ pub struct Route {
 #[derive(Debug, Clone)]
 pub struct ResolvedRouteConfig {
     pub target: Option<String>,
+    pub anthropic_target: Option<String>,
     pub upstream_formats: UpstreamFormats,
     pub api_key: Option<String>,
     pub upstream_model: Option<String>,
@@ -234,6 +245,36 @@ impl Config {
                         name
                     )));
                 }
+                // Validate aliases
+                for alias in &mc.aliases {
+                    if alias.is_empty() {
+                        return Err(ConfigError(format!(
+                            "route '{}' model '{}' has an empty alias",
+                            name, model_name
+                        )));
+                    }
+                    if route.models.contains_key(alias.as_str()) {
+                        return Err(ConfigError(format!(
+                            "route '{}' model '{}' alias '{}' conflicts with another model name",
+                            name, model_name, alias
+                        )));
+                    }
+                }
+                // Validate anthropic_target URL
+                if let Some(ref at) = mc.anthropic_target {
+                    if at.is_empty() {
+                        return Err(ConfigError(format!(
+                            "route '{}' model '{}' has empty anthropic_target",
+                            name, model_name
+                        )));
+                    }
+                    if let Err(e) = at.parse::<http::Uri>() {
+                        return Err(ConfigError(format!(
+                            "route '{}' model '{}' anthropic_target '{}' is not a valid URL: {}",
+                            name, model_name, at, e
+                        )));
+                    }
+                }
                 if let Some(ref target) = mc.target {
                     if target.is_empty() {
                         return Err(ConfigError(format!(
@@ -268,6 +309,7 @@ impl Config {
         let d = &self.defaults;
         Some(ResolvedRouteConfig {
             target: route.target.clone(),
+            anthropic_target: None,
             upstream_formats: route.upstream_formats.clone(),
             api_key: route.api_key.as_ref().map(|s| expand_env_vars(s)),
             upstream_model: route.upstream_model.clone(),
@@ -293,12 +335,15 @@ impl Config {
         self.routes.keys().map(|s| s.as_str()).collect()
     }
 
-    /// Collect all model names from all routes (for GET /v1/models).
+    /// Collect all model names (canonical + aliases) from all routes (for GET /v1/models).
     pub fn all_model_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         for route in self.routes.values() {
-            for model_name in route.models.keys() {
+            for (model_name, mc) in &route.models {
                 names.push(model_name.clone());
+                for alias in &mc.aliases {
+                    names.push(alias.clone());
+                }
             }
         }
         names.sort();
@@ -310,14 +355,24 @@ impl Config {
 impl ResolvedRouteConfig {
     /// Apply model-level overrides on top of the resolved route config.
     ///
-    /// If the model is not found in the models map, returns a clone of self unchanged.
+    /// Looks up the model by canonical name first, then by alias.
+    /// If the model is not found at all, returns a clone of self unchanged.
     pub fn resolve_model(&self, model: &str) -> ResolvedRouteConfig {
-        let Some(mc) = self.models.get(model) else {
+        // Try canonical name first, then aliases
+        let mc = self.models.get(model).or_else(|| {
+            self.models
+                .values()
+                .find(|mc| mc.aliases.iter().any(|a| a == model))
+        });
+        let Some(mc) = mc else {
             return self.clone();
         };
         let mut result = self.clone();
         if let Some(t) = &mc.target {
             result.target = Some(t.clone());
+        }
+        if let Some(t) = &mc.anthropic_target {
+            result.anthropic_target = Some(t.clone());
         }
         if !mc.upstream_formats.is_empty() {
             result.upstream_formats = mc.upstream_formats.clone();
@@ -444,6 +499,105 @@ api_key = "test-key"
         assert!(config.validate().is_ok());
         let rc = config.resolve_default_route().unwrap();
         assert!(rc.target.is_none()); // default route has no route-level target
+    }
+
+    #[test]
+    fn test_model_alias_resolution() {
+        let toml_str = r#"
+[defaults]
+
+[routes.default]
+
+[routes.default.models."deepseek-v4-pro"]
+aliases = ["proxy/deepseek-v4-pro", "deepseek"]
+target = "https://api.deepseek.com"
+anthropic_target = "https://api.deepseek.com/anthropic"
+api_key = "test-key"
+upstream_model = "deepseek-v4-pro"
+upstream_formats = ["responses", "chat", "anthropic"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.validate().is_ok());
+        let rc = config.resolve_default_route().unwrap();
+
+        // Canonical name resolves
+        let r1 = rc.resolve_model("deepseek-v4-pro");
+        assert_eq!(r1.target.as_deref(), Some("https://api.deepseek.com"));
+        assert_eq!(
+            r1.anthropic_target.as_deref(),
+            Some("https://api.deepseek.com/anthropic")
+        );
+
+        // Alias resolves to same config
+        let r2 = rc.resolve_model("proxy/deepseek-v4-pro");
+        assert_eq!(r2.target.as_deref(), Some("https://api.deepseek.com"));
+        assert_eq!(r2.upstream_model.as_deref(), Some("deepseek-v4-pro"));
+
+        let r3 = rc.resolve_model("deepseek");
+        assert_eq!(r3.target.as_deref(), Some("https://api.deepseek.com"));
+
+        // Unknown model returns unchanged
+        let r4 = rc.resolve_model("unknown-model");
+        assert!(r4.target.is_none());
+    }
+
+    #[test]
+    fn test_alias_conflict_with_model_name_fails() {
+        let toml_str = r#"
+[defaults]
+
+[routes.default]
+
+[routes.default.models."model-a"]
+aliases = ["model-b"]
+target = "https://api.example.com"
+
+[routes.default.models."model-b"]
+target = "https://api2.example.com"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .0
+            .contains("conflicts with another model name"));
+    }
+
+    #[test]
+    fn test_all_model_names_includes_aliases() {
+        let toml_str = r#"
+[defaults]
+
+[routes.default]
+
+[routes.default.models."deepseek-v4-pro"]
+aliases = ["proxy/deepseek-v4-pro", "deepseek"]
+target = "https://api.deepseek.com"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let names = config.all_model_names();
+        assert!(names.contains(&"deepseek-v4-pro".to_string()));
+        assert!(names.contains(&"proxy/deepseek-v4-pro".to_string()));
+        assert!(names.contains(&"deepseek".to_string()));
+        assert_eq!(names.len(), 3);
+    }
+
+    #[test]
+    fn test_empty_alias_fails() {
+        let toml_str = r#"
+[defaults]
+
+[routes.default]
+
+[routes.default.models."model-a"]
+aliases = [""]
+target = "https://api.example.com"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("empty alias"));
     }
 
     #[test]

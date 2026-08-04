@@ -77,12 +77,25 @@ upstream_model = "deepseek-chat"
 # All fields are optional — only specified fields override the route-level config.
 #
 #   target           — upstream base URL (llm-proxy auto-appends standard API path)
+#   anthropic_target — alternative base URL for Anthropic Messages protocol
+#                      (when upstream uses a different endpoint for Anthropic format)
+#   aliases          — model name aliases; requests using any alias route to this entry
 #   upstream_formats — list of protocols the upstream supports, ordered by preference
 #                      ["responses"] / ["chat"] / ["anthropic"] / ["chat", "anthropic"]
 #   api_key          — API key for the upstream (supports ${ENV_VAR} expansion)
 #   upstream_model   — rewrite the model field in requests (and auto-rewrite responses)
 #   max_retries, base_delay_ms, max_delay_ms, max_total_wait_ms,
 #   connect_timeout_secs, retry_status_codes
+#
+# Example with aliases and anthropic_target:
+#
+# [routes.default.models."deepseek-v4-pro"]
+# aliases = ["proxy/deepseek-v4-pro", "deepseek"]
+# target = "https://api.deepseek.com"
+# anthropic_target = "https://api.deepseek.com/anthropic"
+# api_key = "${DEEPSEEK_API_KEY}"
+# upstream_model = "deepseek-v4-pro"
+# upstream_formats = ["responses", "chat", "anthropic"]
 #
 # ── Named Route with Model Overrides ───────────────────────────────────────
 #

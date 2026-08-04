@@ -271,8 +271,25 @@ pub async fn handle_request(
         );
     }
 
-    // Determine target URL
-    let target = match &route_config.target {
+    // Detect inbound protocol from URL path
+    let inbound_protocol = format::Protocol::from_path(&rest).unwrap_or(format::Protocol::Chat); // default to chat if unknown
+
+    // Determine conversion direction
+    let conversion = format::conversion_direction(inbound_protocol, &route_config.upstream_formats);
+
+    // Determine the upstream protocol (target format)
+    let upstream_protocol = conversion.map(|(_, to)| to).unwrap_or(inbound_protocol);
+
+    // Determine target URL — use anthropic_target when the upstream protocol is Anthropic
+    let raw_target = if upstream_protocol == format::Protocol::Anthropic {
+        route_config
+            .anthropic_target
+            .as_ref()
+            .or(route_config.target.as_ref())
+    } else {
+        route_config.target.as_ref()
+    };
+    let target = match raw_target {
         Some(t) => t.clone(),
         None => {
             return error_response(
@@ -282,15 +299,6 @@ pub async fn handle_request(
             );
         }
     };
-
-    // Detect inbound protocol from URL path
-    let inbound_protocol = format::Protocol::from_path(&rest).unwrap_or(format::Protocol::Chat); // default to chat if unknown
-
-    // Determine conversion direction
-    let conversion = format::conversion_direction(inbound_protocol, &route_config.upstream_formats);
-
-    // Determine the upstream protocol (target format)
-    let upstream_protocol = conversion.map(|(_, to)| to).unwrap_or(inbound_protocol);
 
     // Inject API key from config
     let forward_headers = if let Some(ref api_key) = route_config.api_key {
