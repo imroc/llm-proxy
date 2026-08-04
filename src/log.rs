@@ -12,9 +12,13 @@ pub struct LogLevelHandle {
 }
 
 impl LogLevelHandle {
-    /// Update the global log filter, e.g. "info", "debug", "trace".
+    /// Update the log filter at runtime, e.g. "info", "debug", "trace".
+    ///
+    /// The level is scoped to the `llm_proxy` crate only — dependency crates
+    /// (h2, hyper, reqwest, etc.) stay at `warn` to avoid noisy frame-level logs.
     pub fn set_level(&self, level: &str) {
-        match EnvFilter::try_new(level) {
+        let scoped = Self::scope_level(level);
+        match EnvFilter::try_new(&scoped) {
             Ok(filter) => {
                 if self.handle.modify(|f| *f = filter).is_ok() {
                     tracing::info!("log level updated: {}", level);
@@ -23,6 +27,19 @@ impl LogLevelHandle {
             Err(e) => {
                 tracing::warn!("invalid log level '{}', keeping current: {}", level, e);
             }
+        }
+    }
+
+    /// Scope a bare level string to the llm_proxy crate.
+    ///
+    /// "debug" → "warn,llm_proxy=debug"
+    /// "warn,llm_proxy=debug" → passed through as-is (already scoped)
+    fn scope_level(level: &str) -> String {
+        // If the user already provided a complex filter, use it as-is
+        if level.contains(',') || level.contains('=') {
+            level.to_string()
+        } else {
+            format!("warn,llm_proxy={}", level)
         }
     }
 }
@@ -34,7 +51,8 @@ impl LogLevelHandle {
 /// later runtime updates via the returned handle still apply).
 /// If `RUST_LOG_FORMAT=json`, use JSON output.
 pub fn init_tracing(level: &str) -> LogLevelHandle {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(LogLevelHandle::scope_level(level)));
     let (filter, handle) = reload::Layer::new(filter);
 
     let format = std::env::var("RUST_LOG_FORMAT").unwrap_or_default();
