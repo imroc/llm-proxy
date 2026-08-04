@@ -1,6 +1,6 @@
 [package]
 name = "llm-proxy-rs"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2021"
 license = "MIT"
 description = "Thin local proxy for LLM APIs with automatic retry, protocol transform, and model-level routing"
