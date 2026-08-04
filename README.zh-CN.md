@@ -39,7 +39,7 @@ cp config.example.toml config.toml
 # 编辑 config.toml 指向你的 API
 
 # 运行
-./target/release/llm-proxy --config config.toml --log-level info
+./target/release/llm-proxy --config config.toml
 ```
 
 将 AI CLI 工具的 API URL 指向 `http://127.0.0.1:8888`（默认路由）或 `http://127.0.0.1:8888/{route_name}/{api_path}`（命名路由）。
@@ -47,6 +47,9 @@ cp config.example.toml config.toml
 ## 配置
 
 ```toml
+# 日志级别（error, warn, info, debug, trace），支持热加载
+log_level = "info"
+
 [defaults]
 max_retries = 9999           # 实际无限
 base_delay_ms = 1000         # 指数退避基数

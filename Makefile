@@ -7,7 +7,7 @@ build:
 	cargo build --release
 
 run:
-	cargo run -- --config config.toml --log-level info
+	cargo run -- --config config.toml
 
 # Update: rebuild and replace the binary in PATH (for human verification after AI dev)
 # Must stop service before cp to avoid "Text file busy", then start after.

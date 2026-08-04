@@ -13,10 +13,17 @@ pub const DEFAULT_ROUTE: &str = "default";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    /// Log level (error, warn, info, debug, trace). Hot-reloadable.
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
     #[serde(default)]
     pub defaults: Defaults,
     #[serde(default)]
     pub routes: HashMap<String, Route>,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -354,7 +361,11 @@ pub struct ConfigWatcher {
 }
 
 impl ConfigWatcher {
-    pub fn start(config: Arc<ArcSwap<Config>>, path: PathBuf) -> Result<Self, ConfigError> {
+    pub fn start(
+        config: Arc<ArcSwap<Config>>,
+        path: PathBuf,
+        log_handle: crate::log::LogLevelHandle,
+    ) -> Result<Self, ConfigError> {
         let watch_path = path.clone();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if let Ok(event) = res {
@@ -367,12 +378,14 @@ impl ConfigWatcher {
                 // Debounce: check mtime, wait 100ms, reload
                 let path = watch_path.clone();
                 let config = config.clone();
+                let log_handle = log_handle.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     match Config::load(&path) {
                         Ok(new_config) => {
                             let route_names = new_config.route_names();
                             info!("config reloaded: routes = {}", route_names.join(", "));
+                            log_handle.set_level(&new_config.log_level);
                             config.store(Arc::new(new_config));
                         }
                         Err(e) => {

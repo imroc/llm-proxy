@@ -39,7 +39,7 @@ cp config.example.toml config.toml
 # Edit config.toml to point to your API
 
 # Run
-./target/release/llm-proxy --config config.toml --log-level info
+./target/release/llm-proxy --config config.toml
 ```
 
 Point your AI CLI tool's API URL to `http://127.0.0.1:8888` (default route) or `http://127.0.0.1:8888/{route_name}/{api_path}` (named route).
@@ -47,6 +47,9 @@ Point your AI CLI tool's API URL to `http://127.0.0.1:8888` (default route) or `
 ## Configuration
 
 ```toml
+# Log level (error, warn, info, debug, trace). Hot-reloadable.
+log_level = "info"
+
 [defaults]
 max_retries = 9999           # Effectively unlimited
 base_delay_ms = 1000         # Exponential backoff base

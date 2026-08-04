@@ -3,6 +3,9 @@
 # Copy this file to config.toml and adjust as needed.
 # The proxy hot-reloads this file on changes — no restart needed.
 
+# Log level: error, warn, info, debug, trace (hot-reloadable)
+log_level = "info"
+
 [defaults]
 # Maximum retry attempts (9999 = effectively unlimited)
 max_retries = 9999

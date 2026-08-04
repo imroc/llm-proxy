@@ -1,25 +1,57 @@
 use serde_json::Value;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{reload, EnvFilter, Registry};
+
+type FilterHandle = reload::Handle<EnvFilter, Registry>;
+
+/// Handle for dynamically updating the log level at runtime.
+#[derive(Clone)]
+pub struct LogLevelHandle {
+    handle: FilterHandle,
+}
+
+impl LogLevelHandle {
+    /// Update the global log filter, e.g. "info", "debug", "trace".
+    pub fn set_level(&self, level: &str) {
+        match EnvFilter::try_new(level) {
+            Ok(filter) => {
+                if self.handle.modify(|f| *f = filter).is_ok() {
+                    tracing::info!("log level updated: {}", level);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("invalid log level '{}', keeping current: {}", level, e);
+            }
+        }
+    }
+}
 
 /// Initialize tracing subscriber with the given log level.
+/// Returns a handle that can update the filter at runtime (config hot reload).
 ///
-/// Supports `RUST_LOG` env var override. If `RUST_LOG_FORMAT=json`, use JSON output.
-pub fn init_tracing(level: &str) {
+/// Supports `RUST_LOG` env var override (takes precedence over `level` at startup;
+/// later runtime updates via the returned handle still apply).
+/// If `RUST_LOG_FORMAT=json`, use JSON output.
+pub fn init_tracing(level: &str) -> LogLevelHandle {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    let (filter, handle) = reload::Layer::new(filter);
 
     let format = std::env::var("RUST_LOG_FORMAT").unwrap_or_default();
     if format == "json" {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
+        let fmt_layer = tracing_subscriber::fmt::layer()
             .with_target(false)
             .json()
-            .init();
+            .with_filter(filter);
+        Registry::default().with(fmt_layer).init();
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
+        let fmt_layer = tracing_subscriber::fmt::layer()
             .with_target(false)
-            .init();
+            .with_filter(filter);
+        Registry::default().with(fmt_layer).init();
     }
+
+    LogLevelHandle { handle }
 }
 
 /// Best-effort extraction of the `model` field from a request body.

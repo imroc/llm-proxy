@@ -21,10 +21,6 @@ struct Args {
     /// Listen address
     #[arg(short, long, default_value = "127.0.0.1:8888")]
     addr: String,
-
-    /// Log level (error, warn, info, debug, trace)
-    #[arg(long, default_value = "info")]
-    log_level: String,
 }
 
 #[tokio::main]
@@ -44,8 +40,8 @@ async fn main() {
         }
     };
 
-    // Init tracing
-    log::init_tracing(&args.log_level);
+    // Init tracing (log level comes from config, hot-reloadable)
+    let log_handle = log::init_tracing(&config.log_level);
 
     let addr: SocketAddr = match args.addr.parse() {
         Ok(a) => a,
@@ -74,10 +70,15 @@ async fn main() {
     // Wrap config in ArcSwap for hot reload
     let config = Arc::new(ArcSwap::from_pointee(config));
 
-    // Start config watcher
-    if let Err(e) = config::ConfigWatcher::start(config.clone(), args.config.clone()) {
-        tracing::warn!("config hot reload disabled: {}", e);
-    }
+    // Start config watcher (must keep the returned watcher alive)
+    let _config_watcher =
+        match config::ConfigWatcher::start(config.clone(), args.config.clone(), log_handle) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("config hot reload disabled: {}", e);
+                return;
+            }
+        };
 
     // Create metrics
     let metrics = metrics::Metrics::new();
