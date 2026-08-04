@@ -372,6 +372,11 @@ pub async fn handle_request(
         Some((from, to)) => format!("{}→{}", from, to),
         None => "passthrough".to_string(),
     };
+    // Append model mapping to the description when a rewrite occurs
+    let conversion_desc = match &route_config.upstream_model {
+        Some(um) if um != model_str => format!("{} model={}→{}", conversion_desc, model_str, um),
+        _ => conversion_desc,
+    };
     info!(
         "{} -> {} {} (body={} bytes)",
         tag,
