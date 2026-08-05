@@ -704,6 +704,20 @@ async fn build_non_streaming_response(
     resp
 }
 
+/// Extract complete lines (terminated by '\n') from a byte buffer, advancing
+/// `line_start` past them. Lines are decoded as UTF-8 only after being fully
+/// assembled, so multi-byte codepoints split across network chunk boundaries
+/// are preserved instead of being replaced with U+FFFD (mojibake).
+fn extract_complete_lines(buffer: &[u8], line_start: &mut usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(rel) = buffer[*line_start..].iter().position(|&b| b == b'\n') {
+        let line_end = *line_start + rel + 1;
+        lines.push(String::from_utf8_lossy(&buffer[*line_start..line_end]).into_owned());
+        *line_start = line_end;
+    }
+    lines
+}
+
 /// Build a streaming response, applying protocol transform if needed.
 async fn build_streaming_response(
     response: reqwest::Response,
@@ -735,18 +749,21 @@ async fn build_streaming_response(
     tokio::spawn(async move {
         use futures::StreamExt;
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        // Byte-level buffer: network chunks can split a UTF-8 codepoint in
+        // the middle (e.g. a Chinese character like 支 = E6 94 AF). Decoding
+        // each chunk with from_utf8_lossy independently would replace the
+        // split codepoint with U+FFFD (mojibake). Only decode once a complete
+        // line (ending in '\n') has been assembled.
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut line_start = 0usize;
 
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    buffer.extend_from_slice(&chunk);
 
-                    // Process complete lines
-                    while let Some(pos) = buffer.find('\n') {
-                        let line = buffer[..=pos].to_string();
-                        buffer = buffer[pos + 1..].to_string();
-
+                    // Process complete lines as they become available
+                    for line in extract_complete_lines(&buffer, &mut line_start) {
                         let transformed = stream_transformer.transform_sse_line(&line);
                         if let Some(output) = transformed {
                             if tx.send(Ok(Bytes::from(output))).await.is_err() {
@@ -771,8 +788,9 @@ async fn build_streaming_response(
         }
 
         // Flush remaining buffer
-        if !buffer.is_empty() {
-            let transformed = stream_transformer.transform_sse_line(&buffer);
+        if line_start < buffer.len() {
+            let tail = String::from_utf8_lossy(&buffer[line_start..]).into_owned();
+            let transformed = stream_transformer.transform_sse_line(&tail);
             if let Some(output) = transformed {
                 let _ = tx.send(Ok(Bytes::from(output))).await;
             }
@@ -822,4 +840,60 @@ async fn build_streaming_response(
     }
 
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_complete_lines;
+
+    #[test]
+    fn utf8_codepoint_split_across_chunks_is_reassembled() {
+        // "支" = U+652F = E6 94 AF in UTF-8. Split the byte stream right after
+        // the first byte of "支" so both chunks end mid-codepoint. Decoding
+        // each chunk independently would produce U+FFFD mojibake.
+        let text = "你支持的这个方案没问题\ndata: [DONE]\n\n";
+        let bytes = text.as_bytes();
+        let cut = bytes
+            .iter()
+            .position(|&b| b == b'\x94')
+            .expect("found second byte of 支");
+        assert_eq!(&bytes[cut - 1..cut + 2], b"\xe6\x94\xaf");
+
+        let mut buffer = Vec::new();
+        let mut line_start = 0usize;
+        let mut lines = Vec::new();
+        for chunk in [&bytes[..cut], &bytes[cut..]] {
+            buffer.extend_from_slice(chunk);
+            lines.extend(extract_complete_lines(&buffer, &mut line_start));
+        }
+
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("你支持的这个方案没问题"));
+        assert!(!lines[0].contains('\u{FFFD}'), "no replacement chars");
+        assert_eq!(lines[1], "data: [DONE]\n");
+        assert_eq!(lines[2], "\n");
+    }
+
+    #[test]
+    fn line_split_across_chunks_is_reassembled() {
+        let text = "data: {\"content\":\"abc\"}\n\n";
+        let bytes = text.as_bytes();
+        let cut = 20;
+
+        let mut buffer = Vec::new();
+        let mut line_start = 0usize;
+        let mut lines = Vec::new();
+        for chunk in [&bytes[..cut], &bytes[cut..]] {
+            buffer.extend_from_slice(chunk);
+            lines.extend(extract_complete_lines(&buffer, &mut line_start));
+        }
+
+        assert_eq!(
+            lines,
+            vec![
+                String::from("data: {\"content\":\"abc\"}\n"),
+                String::from("\n"),
+            ]
+        );
+    }
 }
