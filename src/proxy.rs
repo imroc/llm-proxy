@@ -542,6 +542,14 @@ pub async fn handle_request(
                     .unwrap_or(false);
 
                 if is_stream {
+                    if !response.status().is_success() {
+                        tracing::debug!(
+                            "{} upstream returned {}: request body: {}",
+                            tag,
+                            response.status(),
+                            String::from_utf8_lossy(&request_body)
+                        );
+                    }
                     return build_streaming_response(
                         response,
                         upstream_protocol,
@@ -560,6 +568,7 @@ pub async fn handle_request(
                         response_model,
                         &tag,
                         &upstream_url,
+                        &request_body,
                     )
                     .await;
                     info!(
@@ -631,6 +640,7 @@ async fn build_non_streaming_response(
     client_model: Option<&str>,
     tag: &str,
     _upstream_url: &str,
+    request_body: &[u8],
 ) -> Response<ResponseBody> {
     let status = response.status();
     let resp_headers = strip_response_hop_by_hop(response.headers());
@@ -645,13 +655,18 @@ async fn build_non_streaming_response(
 
     // Debug log non-200 response bodies
     if !status.is_success() {
-        let body_preview = String::from_utf8_lossy(&body_bytes);
-        let p = if body_preview.len() > 1000 {
-            &body_preview[..1000]
-        } else {
-            &body_preview
-        };
-        tracing::debug!("{} upstream returned {}: response body: {}", tag, status, p);
+        tracing::debug!(
+            "{} upstream returned {}: request body: {}",
+            tag,
+            status,
+            String::from_utf8_lossy(request_body)
+        );
+        tracing::debug!(
+            "{} upstream returned {}: response body: {}",
+            tag,
+            status,
+            String::from_utf8_lossy(&body_bytes)
+        );
     }
 
     // Apply response transform only on 2xx success responses.
