@@ -18,6 +18,7 @@ It also solves a second problem: different AI tools use different API protocols 
 - **Flexible protocol conversion** — auto-detects inbound format (Responses/Chat/Anthropic) and converts to any supported upstream format
 - **Default route** — all AI tools point to the same address; the `model` field in the request body determines the upstream target
 - **API key management** — per-model API keys with `${ENV_VAR}` expansion, independent of client-side keys
+- **Upstream proxy** — route upstream traffic through a corporate proxy via `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/`NO_PROXY`
 - **Model name mapping** — automatic bidirectional model name rewriting (`upstream_model`)
 - **GET /v1/models** — returns all configured models for client-side model discovery
 - **Transparent** — CLI tools don't need any retry support; just point them at the proxy
@@ -128,6 +129,30 @@ When `api_key` is configured at the model or route level, the proxy:
 3. Forwards to the upstream
 
 When no `api_key` is configured (named routes without `api_key`), the client's original `Authorization` header is forwarded as-is (backward compatible).
+
+### Upstream Proxy
+
+Upstream requests honor the standard proxy environment variables:
+
+| Variable      | Effect                                           |
+|---------------|--------------------------------------------------|
+| `HTTPS_PROXY` | Proxy for `https://` upstream targets            |
+| `HTTP_PROXY`  | Proxy for `http://` upstream targets             |
+| `ALL_PROXY`   | Fallback for both, used when the above are unset |
+| `NO_PROXY`    | Comma-separated hosts that bypass the proxy      |
+
+Both uppercase and lowercase names work (uppercase wins).
+
+```bash
+HTTPS_PROXY=http://proxy.example.com:8080 ./llm-proxy --config config.toml
+```
+
+Notes:
+
+- The variables are read once at process startup and logged (`upstream proxy enabled via environment: ...`). Changing them requires a restart — config hot-reload does not re-read them.
+- When running as a service, the variables must be present in the service environment:
+  - systemd: `Environment="HTTPS_PROXY=http://proxy.example.com:8080"` in the unit file
+  - launchd: `<key>EnvironmentVariables</key><dict><key>HTTPS_PROXY</key><string>http://proxy.example.com:8080</string></dict>` in the plist
 
 ## Installation
 

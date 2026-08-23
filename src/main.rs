@@ -23,6 +23,35 @@ struct Args {
     addr: String,
 }
 
+/// Return the first non-empty value among the given environment variables,
+/// matching reqwest's precedence (uppercase before lowercase).
+fn first_env(names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .filter_map(|n| std::env::var(n).ok())
+        .find(|v| !v.is_empty())
+}
+
+/// Log upstream proxy environment variables once at startup. reqwest
+/// snapshots these when the client is built, so they must be set in the
+/// process environment before llm-proxy starts (hot reload does not pick up
+/// changes to them).
+fn log_env_proxy() {
+    let https_proxy = first_env(&["HTTPS_PROXY", "https_proxy"]);
+    let http_proxy = first_env(&["HTTP_PROXY", "http_proxy"]);
+    let all_proxy = first_env(&["ALL_PROXY", "all_proxy"]);
+    let no_proxy = first_env(&["NO_PROXY", "no_proxy"]);
+    if https_proxy.is_some() || http_proxy.is_some() || all_proxy.is_some() {
+        info!(
+            "upstream proxy enabled via environment: https_proxy={} http_proxy={} all_proxy={} no_proxy={}",
+            https_proxy.as_deref().unwrap_or("unset"),
+            http_proxy.as_deref().unwrap_or("unset"),
+            all_proxy.as_deref().unwrap_or("unset"),
+            no_proxy.as_deref().unwrap_or("unset"),
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -58,6 +87,8 @@ async fn main() {
         addr,
         route_names.join(", ")
     );
+
+    log_env_proxy();
 
     // Create reqwest client
     let client = reqwest::Client::builder()

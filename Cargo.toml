@@ -1,6 +1,6 @@
 [package]
 name = "llm-proxy-rs"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 license = "MIT"
 description = "Thin local proxy for LLM APIs with automatic retry, protocol transform, and model-level routing"
@@ -22,7 +22,7 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
 http-body = "1"
 http-body-util = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "system-proxy"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

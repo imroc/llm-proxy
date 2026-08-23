@@ -18,6 +18,7 @@
 - **灵活协议转换** — 自动检测入站格式（Responses/Chat/Anthropic）并转换为上游支持的任意格式
 - **默认路由** — 所有 AI 工具指向同一地址，请求体中的 `model` 字段决定上游目标
 - **API key 管理** — 按 model 配置 API key，支持 `${ENV_VAR}` 环境变量展开，独立于客户端 key
+- **上游代理** — 通过 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/`NO_PROXY` 将上游流量路由到公司代理
 - **模型名称映射** — `upstream_model` 双向自动改写（请求改写 + 响应回写）
 - **GET /v1/models** — 返回配置中的模型列表，供客户端动态发现
 - **透明** — CLI 工具无需任何重试支持，只需指向代理
@@ -128,6 +129,30 @@ upstream_model = "deepseek-chat"
 3. 转发给上游
 
 未配置 `api_key` 时（如命名路由未设 api_key），客户端原始 `Authorization` header 原样转发（向后兼容）。
+
+### 上游代理
+
+上游请求遵循标准代理环境变量：
+
+| 环境变量      | 作用                                   |
+|---------------|----------------------------------------|
+| `HTTPS_PROXY` | `https://` 上游目标使用的代理          |
+| `HTTP_PROXY`  | `http://` 上游目标使用的代理           |
+| `ALL_PROXY`   | 兜底代理，上述变量未设置时生效         |
+| `NO_PROXY`    | 逗号分隔的 host 列表，这些目标绕过代理 |
+
+大小写变量名均支持（大写优先）。
+
+```bash
+HTTPS_PROXY=http://proxy.example.com:8080 ./llm-proxy --config config.toml
+```
+
+注意事项：
+
+- 环境变量在进程启动时读取一次并打印日志（`upstream proxy enabled via environment: ...`）。修改后需重启进程——配置热重载不会重新读取。
+- 以服务方式运行时，变量必须存在于服务环境中：
+  - systemd：unit 文件中 `Environment="HTTPS_PROXY=http://proxy.example.com:8080"`
+  - launchd：plist 中 `<key>EnvironmentVariables</key><dict><key>HTTPS_PROXY</key><string>http://proxy.example.com:8080</string></dict>`
 
 ## 安装
 

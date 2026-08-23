@@ -8,7 +8,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -103,6 +103,42 @@ async fn start_mock_upstream(mock: Arc<MockUpstream>) -> SocketAddr {
     });
 
     addr
+}
+
+/// Start a fake HTTP CONNECT proxy that records whether it received a
+/// CONNECT request and always rejects the tunnel with 403.
+async fn start_fake_connect_proxy() -> (SocketAddr, Arc<AtomicBool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let saw_connect = Arc::new(AtomicBool::new(false));
+
+    let saw_connect_clone = saw_connect.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            let saw_connect = saw_connect_clone.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut stream = stream;
+                let mut buf = vec![0u8; 1024];
+                let Ok(n) = stream.read(&mut buf).await else {
+                    return;
+                };
+                let head = String::from_utf8_lossy(&buf[..n]);
+                if head.starts_with("CONNECT") {
+                    saw_connect.store(true, Ordering::SeqCst);
+                }
+                let _ = stream
+                    .write_all(b"HTTP/1.1 403 Filtered\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            });
+        }
+    });
+
+    (addr, saw_connect)
 }
 
 /// Start the proxy with a given config.
@@ -431,6 +467,44 @@ target = "http://127.0.0.1:1"
 
     assert_eq!(status, 502);
     assert!(body.contains("upstream_failed"));
+}
+
+#[tokio::test]
+async fn test_https_proxy_env_var_routes_upstream_via_proxy() {
+    let (fake_proxy_addr, saw_connect) = start_fake_connect_proxy().await;
+
+    // Must be set before the reqwest client is built inside start_proxy,
+    // mirroring how the variable must exist at process startup.
+    std::env::set_var("HTTPS_PROXY", format!("http://{}", fake_proxy_addr));
+
+    let config_str = r#"
+[defaults]
+max_retries = 1
+base_delay_ms = 10
+max_delay_ms = 20
+connect_timeout_secs = 1
+retry_status_codes = [429, 500]
+
+[routes.tls]
+target = "https://upstream.example.test"
+"#;
+    let (proxy_addr, _, _) = start_proxy(config_str).await;
+
+    let (status, body) = http_post(
+        proxy_addr,
+        "/tls/v1/chat/completions",
+        r#"{"model":"test","messages":[]}"#,
+    )
+    .await;
+
+    std::env::remove_var("HTTPS_PROXY");
+
+    assert_eq!(status, 502);
+    assert!(body.contains("upstream_failed"));
+    assert!(
+        saw_connect.load(Ordering::SeqCst),
+        "upstream request should be routed through HTTPS_PROXY"
+    );
 }
 
 #[tokio::test]
