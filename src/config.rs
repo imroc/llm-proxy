@@ -12,6 +12,7 @@ use tracing::{info, warn};
 pub const DEFAULT_ROUTE: &str = "default";
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Log level (error, warn, info, debug, trace). Hot-reloadable.
     #[serde(default = "default_log_level")]
@@ -27,6 +28,7 @@ fn default_log_level() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Defaults {
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
@@ -59,6 +61,7 @@ impl Default for Defaults {
 ///
 /// All fields are optional — only specified fields override the route-level config.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     pub target: Option<String>,
     /// Alternative base URL for Anthropic Messages protocol.
@@ -96,6 +99,7 @@ pub struct ModelConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Route {
     /// Upstream base URL. Optional for default route (each model has its own target).
     #[serde(default)]
@@ -613,5 +617,46 @@ max_delay_ms = 60000
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_unknown_field_rejected() {
+        // The d6c31c7 refactor removed the `transform` field in favor of
+        // `upstream_formats`; a stale config carrying it must fail loudly at
+        // load instead of being silently ignored (and then routing wrong).
+        let toml_str = r#"
+[defaults]
+
+[routes.tkehub-codex]
+target = "http://tkehub.woa.com"
+transform = "responses_to_chat"
+"#;
+        let result: Result<Config, _> = toml::from_str(toml_str);
+        assert!(result.is_err());
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("transform"),
+            "error should name the unknown field: {message}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_model_field_rejected() {
+        let toml_str = r#"
+[defaults]
+
+[routes.default]
+
+[routes.default.models."m"]
+target = "http://localhost:8080"
+rewrite_response_model = true
+"#;
+        let result: Result<Config, _> = toml::from_str(toml_str);
+        assert!(result.is_err());
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("rewrite_response_model"),
+            "error should name the unknown field: {message}"
+        );
     }
 }
